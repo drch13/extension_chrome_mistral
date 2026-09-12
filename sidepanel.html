@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Web AI Assistant</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-actions">
+      <button id="newChatBtn" class="icon-btn" title="Nouvelle conversation" aria-label="Nouvelle conversation">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+        </svg>
+      </button>
+      <button id="historyBtn" class="icon-btn" title="Historique des conversations" aria-label="Historique">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.96 8.96 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/>
+        </svg>
+      </button>
+      <button id="settingsBtn" class="icon-btn" title="Paramètres (clé API)" aria-label="Paramètres">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M19.14 12.94a7.49 7.49 0 0 0 .05-.94 7.49 7.49 0 0 0-.05-.94l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.61-.22l-2.49 1a7.3 7.3 0 0 0-1.62-.94l-.38-2.65A.5.5 0 0 0 13.8 2h-4a.5.5 0 0 0-.5.42l-.38 2.65c-.59.24-1.13.56-1.62.94l-2.49-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65a7.49 7.49 0 0 0 0 1.88l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46a.5.5 0 0 0 .61.22l2.49-1c.49.38 1.03.7 1.62.94l.38 2.65a.5.5 0 0 0 .5.42h4a.5.5 0 0 0 .5-.42l.38-2.65c.59-.24 1.13-.56 1.62-.94l2.49 1a.5.5 0 0 0 .61-.22l2-3.46a.5.5 0 0 0-.12-.64l-2.11-1.65zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <section class="controls">
+    <label class="model-label" for="modelSelect">Modèle</label>
+    <select id="modelSelect" class="model-select" title="Choisir le modèle Mistral">
+      <option value="mistral-small-latest">Mistral Small 4</option>
+      <option value="mistral-medium-latest">Mistral Medium 3.5</option>
+      <option value="zai-glm-5-2">GLM 5.2</option>
+    </select>
+    <label id="reasoningToggleWrap" class="reason-toggle" title="Afficher le raisonnement du modèle avant la réponse">
+      <input type="checkbox" id="reasoningToggle" />
+      <span class="reason-toggle-track"><span class="reason-toggle-thumb"></span></span>
+      <span class="reason-toggle-label">Réflexion</span>
+    </label>
+  </section>
+
+  <main id="chat" class="chat" aria-live="polite"></main>
+
+  <footer class="composer">
+    <div id="selectionBox" class="selection-box" hidden>
+      <button id="selectionClear" class="selection-clear" title="Supprimer la sélection" aria-label="Supprimer la sélection">✕</button>
+      <div id="selectionText" class="selection-text"></div>
+    </div>
+    <div class="composer-row">
+      <textarea
+        id="promptInput"
+        class="prompt-input"
+        rows="2"
+        placeholder="Posez une question sur cette page…"
+        aria-label="Votre question"
+      ></textarea>
+      <button id="sendBtn" class="send-btn" title="Envoyer (Entrée)" aria-label="Envoyer">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M2 21l21-9L2 3v7l15 2-15 2v7z"/>
+        </svg>
+      </button>
+    </div>
+  </footer>
+
+  <!-- API key dialog -->
+  <div id="keyDialog" class="dialog-backdrop" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="keyTitle">
+      <h2 id="keyTitle">Clé API Mistral</h2>
+      <div class="dialog-hint">
+        <p>Saisissez votre clé API Mistral.</p>
+        <p>
+          Pour celles et ceux qui ont un compte Mistral Vibe, cette clé est
+          habituellement accessible à l'url suivante :
+          <a class="key-help" href="https://chat.mistral.ai/code/extensions" target="_blank" rel="noopener">https://chat.mistral.ai/code/extensions</a>
+          Cliquez sur « Avancé », puis copiez la clé API Vibe. Cela consommera
+          dans les limites fournies par votre abonnement, qu'il soit gratuit ou
+          Pro, sans frais supplémentaire.
+        </p>
+        <p>
+          Il est aussi possible de générer une autre clé API, mais cela pourrait
+          vous générer des frais proportionnels à votre utilisation ; pour cette
+          raison il vaut mieux utiliser la clé API Vibe fournie avec votre
+          abonnement.
+        </p>
+        <p class="dialog-hint-note">
+          La clé est stockée localement dans votre navigateur (chrome.storage)
+          et n'est jamais inscrite en dur ni envoyée ailleurs que vers l'API Mistral.
+        </p>
+      </div>
+      <input
+        id="apiKeyInput"
+        type="password"
+        class="key-input"
+        placeholder="ex. AbCdEf12345…"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <p id="keyError" class="key-error" hidden></p>
+      <div class="dialog-actions">
+        <div>
+          <button id="keyCancel" class="btn-ghost">Annuler</button>
+          <button id="keySave" class="btn-primary">Enregistrer</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- History panel -->
+  <div id="historyPanel" class="history-panel" hidden>
+    <div class="history-head">
+      <span>Historique</span>
+      <button id="historyClose" class="icon-btn" title="Fermer" aria-label="Fermer">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+        </svg>
+      </button>
+    </div>
+    <div id="historyList" class="history-list"></div>
+    <button id="historyClear" class="history-clear">Tout effacer</button>
+  </div>
+
+  <script src="vendor/pdf.min.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

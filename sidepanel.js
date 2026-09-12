@@ -1,0 +1,1029 @@
+// Web AI Assistant — side panel logic.
+// Talks to the Mistral La Plateforme chat-completions endpoint.
+// The API key lives in chrome.storage.local (never hardcoded).
+
+const API_URL = "https://api.mistral.ai/v1/chat/completions";
+const MODEL_LABELS = {
+  "mistral-small-latest": "Mistral Small 4",
+  "mistral-medium-latest": "Mistral Medium 3.5",
+  "zai-glm-5-2": "GLM 5.2",
+};
+
+// Conversation history (kept in memory, scoped to the side-panel session).
+let history = []; // messages of the currently open conversation: [{role, content, reasoning?}]
+let apiKey = "";
+let currentModel = "mistral-small-latest";
+let reasoningEnabled = false; // sends reasoning_effort="high" when true (Mistral models only)
+let inFlight = false;
+let lastContext = null; // { url, title, text }
+let currentSelection = ""; // live text selection from the active tab
+let selectionPollTimer = null;
+
+// Persisted conversations (mirrors chrome.storage.local "conversations").
+// Array of { id, title, model, createdAt, updatedAt, messages: [{role, content}] }
+let conversations = [];
+let currentConvId = null; // null when the current view is a fresh, unsaved chat
+
+const MAX_CONVERSATIONS = 200;
+
+// ---- DOM ----
+const chatEl = document.getElementById("chat");
+const promptInput = document.getElementById("promptInput");
+const sendBtn = document.getElementById("sendBtn");
+const modelSelect = document.getElementById("modelSelect");
+const reasoningToggle = document.getElementById("reasoningToggle");
+const reasoningToggleWrap = document.getElementById("reasoningToggleWrap");
+const settingsBtn = document.getElementById("settingsBtn");
+const newChatBtn = document.getElementById("newChatBtn");
+const historyBtn = document.getElementById("historyBtn");
+
+const keyDialog = document.getElementById("keyDialog");
+const apiKeyInput = document.getElementById("apiKeyInput");
+const keyError = document.getElementById("keyError");
+const keySave = document.getElementById("keySave");
+const keyCancel = document.getElementById("keyCancel");
+
+const historyPanel = document.getElementById("historyPanel");
+const historyList = document.getElementById("historyList");
+const historyClose = document.getElementById("historyClose");
+const historyClear = document.getElementById("historyClear");
+
+const selectionBox = document.getElementById("selectionBox");
+const selectionTextEl = document.getElementById("selectionText");
+const selectionClear = document.getElementById("selectionClear");
+
+// ---- Helpers ----
+function escapeHtml(str) {
+  return str.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+// ---- Markdown rendering ----
+// Minimal, dependency-free Markdown -> HTML for assistant answers. HTML is
+// escaped everywhere before any markup is applied, so model output cannot
+// inject tags/scripts. Only http(s) links are turned into <a> (javascript:
+// and other schemes stay as raw text). Inline code and fenced code blocks are
+// extracted first so their contents are never reformatted.
+function mdInline(raw, inlineCodes) {
+  let s = escapeHtml(raw);
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push('<code class="md-inline-code">' + c + "</code>");
+    return "\u0000I" + idx + "\u0000";
+  });
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  s = s.replace(/(^|[^\w])_([^_\n]+)_([^\w]|$)/g, "$1<em>$2</em>$3");
+  return s;
+}
+
+function renderMarkdown(text) {
+  const codeBlocks = [];
+  const inlineCodes = [];
+
+  // Fenced code blocks: extract on raw text, store already-escaped HTML.
+  let src = text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    const langTrim = lang.trim();
+    codeBlocks.push(
+      '<pre class="md-code"><code' +
+      (langTrim ? ' class="md-lang-' + escapeHtml(langTrim) + '"' : "") +
+      ">" + escapeHtml(code.replace(/\n$/, "")) + "</code></pre>"
+    );
+    return "\u0000B" + idx + "\u0000";
+  });
+
+  // Block detection runs on raw lines (so '>' blockquotes aren't hidden by
+  // escaping); inline content is escaped inside mdInline.
+  const lines = src.split("\n");
+  const html = [];
+  let i = 0;
+  let inList = false;
+  let listType = null;
+  let inQuote = false;
+  const closeList = () => { if (inList) { html.push("</" + listType + ">"); inList = false; listType = null; } };
+  const closeQuote = () => { if (inQuote) { html.push("</blockquote>"); inQuote = false; } };
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (/^\u0000B\d+\u0000$/.test(line.trim())) {
+      closeList(); closeQuote();
+      html.push(line.trim());
+      i++; continue;
+    }
+
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      closeList(); closeQuote();
+      const lvl = h[1].length;
+      html.push('<h' + lvl + ' class="md-h md-h' + lvl + '">' + mdInline(h[2], inlineCodes) + "</h" + lvl + ">");
+      i++; continue;
+    }
+
+    const q = line.match(/^>\s?(.*)$/);
+    if (q) {
+      closeList();
+      if (!inQuote) { html.push('<blockquote class="md-quote">'); inQuote = true; }
+      html.push(mdInline(q[1], inlineCodes) + "<br>");
+      i++; continue;
+    }
+    closeQuote();
+
+    const ul = line.match(/^[-*]\s+(.*)$/);
+    if (ul) {
+      if (!inList || listType !== "ul") { closeList(); html.push('<ul class="md-ul">'); inList = true; listType = "ul"; }
+      html.push("<li>" + mdInline(ul[1], inlineCodes) + "</li>");
+      i++; continue;
+    }
+
+    const ol = line.match(/^(\d+)\.\s+(.*)$/);
+    if (ol) {
+      if (!inList || listType !== "ol") { closeList(); html.push('<ol class="md-ol">'); inList = true; listType = "ol"; }
+      html.push("<li>" + mdInline(ol[2], inlineCodes) + "</li>");
+      i++; continue;
+    }
+
+    if (/^(-{3,}|\*{3,})\s*$/.test(line)) {
+      closeList(); closeQuote();
+      html.push('<hr class="md-hr">');
+      i++; continue;
+    }
+
+    if (line.trim() === "") { closeList(); closeQuote(); i++; continue; }
+
+    closeList(); closeQuote();
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== "" &&
+      !/^(#{1,6})\s/.test(lines[i]) && !/^[-*]\s/.test(lines[i]) &&
+      !/^\d+\.\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) &&
+      !/^\u0000B\d+\u0000$/.test(lines[i].trim()) && !/^(-{3,}|\*{3,})\s*$/.test(lines[i])) {
+      para.push(lines[i]);
+      i++;
+    }
+    if (para.length) {
+      // Soft line breaks within a paragraph become <br>.
+      const joined = para.join("\u0000N\u0000");
+      html.push('<p class="md-p">' + mdInline(joined, inlineCodes).replace(/\u0000N\u0000/g, "<br>") + "</p>");
+    }
+  }
+  closeList(); closeQuote();
+
+  let out = html.join("\n");
+  out = out.replace(/\u0000I(\d+)\u0000/g, (_, n) => inlineCodes[+n]);
+  out = out.replace(/\u0000B(\d+)\u0000/g, (_, n) => codeBlocks[+n]);
+  return out;
+}
+
+function addMsg(role, text) {
+  const div = document.createElement("div");
+  div.className = `msg ${role}`;
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+// Render an assistant bubble, optionally with a collapsible reasoning trace
+// shown above the final answer. Returns { root, thinkingEl, answerEl } so the
+// streaming path can fill it in incrementally.
+function addAssistantBubble(reasoning = "", answer = "") {
+  const div = document.createElement("div");
+  div.className = "msg ai";
+
+  const thinkingEl = document.createElement("details");
+  thinkingEl.className = "thinking-block";
+  const summary = document.createElement("summary");
+  summary.textContent = "Réflexion";
+  const thinkingContent = document.createElement("div");
+  thinkingContent.className = "thinking-content";
+  thinkingEl.appendChild(summary);
+  thinkingEl.appendChild(thinkingContent);
+  if (reasoning) {
+    thinkingContent.textContent = reasoning;
+    thinkingEl.open = false;
+  } else {
+    thinkingEl.hidden = true;
+  }
+
+  const answerEl = document.createElement("div");
+  answerEl.className = "answer-content";
+  if (answer) answerEl.innerHTML = renderMarkdown(answer);
+
+  div.appendChild(thinkingEl);
+  div.appendChild(answerEl);
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return { root: div, thinkingEl, thinkingContent, answerEl };
+}
+
+function addSystem(text) {
+  const div = document.createElement("div");
+  div.className = "msg system";
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function addError(text) {
+  const div = document.createElement("div");
+  div.className = "msg error";
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function addContextChip(label) {
+  const div = document.createElement("div");
+  div.className = "context-chip";
+  // Inline SVG instead of the 📄 emoji, which renders as a missing-glyph box
+  // ("_") in the side panel's font. The SVG is styled via .context-chip svg.
+  div.innerHTML =
+    '<svg class="chip-icon" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">' +
+    '<path fill="currentColor" d="M6 2a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm7 1.5L18.5 9H13zM8 13h8v1.5H8zm0 3.5h8V18H8z"/>' +
+    '</svg>';
+  const span = document.createElement("span");
+  span.textContent = label;
+  div.appendChild(span);
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function setBusy(busy) {
+  inFlight = busy;
+  sendBtn.disabled = busy;
+  promptInput.disabled = false;
+}
+
+// ---- Storage ----
+async function loadSettings() {
+  const data = await chrome.storage.local.get(["mistralApiKey", "mistralModel", "mistralReasoning"]);
+  apiKey = data.mistralApiKey || "";
+  currentModel = data.mistralModel || "mistral-small-latest";
+  reasoningEnabled = !!data.mistralReasoning;
+  if (MODEL_LABELS[currentModel]) {
+    modelSelect.value = currentModel;
+  }
+  reasoningToggle.checked = reasoningEnabled;
+  syncReasoningToggleAvailability();
+}
+
+async function saveApiKey(key) {
+  apiKey = key.trim();
+  await chrome.storage.local.set({ mistralApiKey: apiKey });
+}
+
+// reasoning_effort is documented for mistral-small-latest and mistral-medium
+// (3.5). The GLM model exposed here is a third-party one without documented
+// reasoning support, so we disable the toggle for it rather than risk an API
+// error.
+function modelSupportsReasoning(model) {
+  return model === "mistral-small-latest" || model === "mistral-medium-latest";
+}
+
+function syncReasoningToggleAvailability() {
+  const supported = modelSupportsReasoning(currentModel);
+  if (!supported) {
+    // Force it off visually while disabled so the next send never sends
+    // reasoning_effort for an unsupported model.
+    reasoningToggle.checked = false;
+    reasoningToggleWrap.classList.add("disabled");
+    reasoningToggleWrap.title = "Réflexion non disponible pour ce modèle";
+  } else {
+    reasoningToggle.checked = reasoningEnabled;
+    reasoningToggleWrap.classList.remove("disabled");
+    reasoningToggleWrap.title = "Afficher le raisonnement du modèle avant la réponse";
+  }
+}
+
+modelSelect.addEventListener("change", async () => {
+  currentModel = modelSelect.value;
+  await chrome.storage.local.set({ mistralModel: currentModel });
+  syncReasoningToggleAvailability();
+});
+
+reasoningToggle.addEventListener("change", async () => {
+  reasoningEnabled = reasoningToggle.checked && modelSupportsReasoning(currentModel);
+  reasoningToggle.checked = reasoningEnabled;
+  await chrome.storage.local.set({ mistralReasoning: reasoningEnabled });
+});
+
+// ---- Conversation persistence ----
+function genId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function fmtDate(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString("fr-FR", { day: "2-digit", month: "short" }) +
+    " " + d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+}
+
+function deriveTitle(messages) {
+  const firstUser = messages.find((m) => m.role === "user");
+  const t = (firstUser && firstUser.content || "Nouvelle conversation").trim();
+  return t.length > 48 ? t.slice(0, 48) + "…" : t;
+}
+
+async function loadConversations() {
+  const data = await chrome.storage.local.get("conversations");
+  conversations = Array.isArray(data.conversations) ? data.conversations : [];
+}
+
+async function persistConversations() {
+  // Keep the most recent ones and cap to avoid unbounded growth.
+  conversations.sort((a, b) => b.updatedAt - a.updatedAt);
+  if (conversations.length > MAX_CONVERSATIONS) {
+    conversations = conversations.slice(0, MAX_CONVERSATIONS);
+  }
+  await chrome.storage.local.set({ conversations });
+}
+
+function currentConv() {
+  return conversations.find((c) => c.id === currentConvId) || null;
+}
+
+// Persist the in-memory `history` into its conversation record (creating one
+// on first message). Called after each exchange.
+async function syncCurrentConversation() {
+  if (history.length === 0) return;
+  let conv = currentConv();
+  if (!conv) {
+    conv = {
+      id: genId(),
+      title: deriveTitle(history),
+      model: currentModel,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: history,
+    };
+    currentConvId = conv.id;
+    conversations.unshift(conv);
+  } else {
+    conv.messages = history;
+    conv.updatedAt = Date.now();
+    conv.model = currentModel;
+  }
+  await persistConversations();
+}
+
+// Render the chat area from a conversation's messages.
+function renderChat() {
+  chatEl.innerHTML = "";
+  if (currentConvId === null || history.length === 0) {
+    addSystem(currentConvId === null
+      ? "Nouvelle conversation. Posez une question sur la page courante."
+      : "Posez une question sur la page courante (Mistral répond à partir de son contenu).");
+    return;
+  }
+  for (const m of history) {
+    if (m.role === "assistant") {
+      addAssistantBubble(m.reasoning || "", m.content);
+    } else {
+      addMsg("user", m.content);
+    }
+  }
+}
+
+function startNewConversation() {
+  currentConvId = null;
+  history = [];
+  lastContext = null;
+  renderChat();
+  closeHistory();
+  promptInput.focus();
+}
+
+async function openConversation(id) {
+  const conv = conversations.find((c) => c.id === id);
+  if (!conv) return;
+  currentConvId = id;
+  history = conv.messages.slice(); // copy so edits don't mutate stored array indirectly
+  // Reflect that conversation's model in the selector.
+  if (MODEL_LABELS[conv.model]) {
+    currentModel = conv.model;
+    modelSelect.value = conv.model;
+  }
+  renderChat();
+  closeHistory();
+  promptInput.focus();
+}
+
+async function deleteConversation(id) {
+  conversations = conversations.filter((c) => c.id !== id);
+  if (currentConvId === id) {
+    startNewConversation();
+  }
+  await persistConversations();
+  renderHistoryList();
+}
+
+async function clearAllConversations() {
+  conversations = [];
+  currentConvId = null;
+  history = [];
+  renderChat();
+  await chrome.storage.local.set({ conversations: [] });
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  historyList.innerHTML = "";
+  if (conversations.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "Aucune conversation enregistrée.";
+    historyList.appendChild(empty);
+    return;
+  }
+  // Already sorted most-recent first by persistConversations.
+  for (const conv of conversations) {
+    const item = document.createElement("div");
+    item.className = "history-item" + (conv.id === currentConvId ? " active" : "");
+    item.dataset.id = conv.id;
+
+    const main = document.createElement("div");
+    main.className = "history-item-main";
+    const titleEl = document.createElement("div");
+    titleEl.className = "history-item-title";
+    titleEl.textContent = conv.title || "Sans titre";
+    const meta = document.createElement("div");
+    meta.className = "history-item-meta";
+    const label = MODEL_LABELS[conv.model] || conv.model || "";
+    meta.textContent = `${fmtDate(conv.updatedAt)} · ${label} · ${conv.messages.length} msg`;
+    main.appendChild(titleEl);
+    main.appendChild(meta);
+
+    const del = document.createElement("button");
+    del.className = "history-del";
+    del.title = "Supprimer";
+    del.textContent = "✕";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await deleteConversation(conv.id);
+    });
+
+    item.appendChild(main);
+    item.appendChild(del);
+    item.addEventListener("click", () => openConversation(conv.id));
+    historyList.appendChild(item);
+  }
+}
+
+function openHistory() {
+  renderHistoryList();
+  historyPanel.hidden = false;
+}
+function closeHistory() {
+  historyPanel.hidden = true;
+}
+
+newChatBtn.addEventListener("click", startNewConversation);
+historyBtn.addEventListener("click", openHistory);
+historyClose.addEventListener("click", closeHistory);
+historyClear.addEventListener("click", async () => {
+  if (confirm("Supprimer toutes les conversations enregistrées ?")) {
+    await clearAllConversations();
+  }
+});
+
+// ---- API key dialog ----
+function openKeyDialog(prefill = true) {
+  keyError.hidden = true;
+  keyError.textContent = "";
+  if (prefill) apiKeyInput.value = apiKey;
+  else apiKeyInput.value = "";
+  keyDialog.hidden = false;
+  apiKeyInput.focus();
+}
+
+function closeKeyDialog() {
+  keyDialog.hidden = true;
+}
+
+keySave.addEventListener("click", async () => {
+  const val = apiKeyInput.value.trim();
+  if (val.length < 10) {
+    keyError.textContent = "La clé paraît trop courte. Vérifiez votre saisie.";
+    keyError.hidden = false;
+    return;
+  }
+  await saveApiKey(val);
+  closeKeyDialog();
+  if (history.length === 0) {
+    addSystem("Clé enregistrée. Posez votre première question sur la page courante.");
+  }
+});
+
+keyCancel.addEventListener("click", closeKeyDialog);
+
+settingsBtn.addEventListener("click", () => openKeyDialog(true));
+
+// ---- Page content extraction ----
+// Runs in the active tab's page via chrome.scripting. Returns up to ~16k chars
+// of the main readable text so the model can answer "about this page".
+function extractPageContent() {
+  // Executed in the page context (no access to chrome.* APIs here).
+  const title = document.title || "";
+  const url = location.href;
+
+  // Work on a CLONE so we never mutate the real page DOM the user is viewing.
+  function cleanText(rootEl) {
+    if (!rootEl) return "";
+    const clone = rootEl.cloneNode(true);
+    clone.querySelectorAll(
+      "script, style, noscript, iframe, svg, canvas, template"
+    ).forEach((n) => n.remove());
+    return (clone.innerText || clone.textContent || "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
+  }
+
+  // Try the most specific containers first, then fall back to <body>.
+  let text =
+    cleanText(document.querySelector("article")) ||
+    cleanText(document.querySelector("main")) ||
+    cleanText(document.querySelector('[role="main"]')) ||
+    cleanText(document.body);
+
+  const MAX = 16000;
+  if (text.length > MAX) text = text.slice(0, MAX) + "\n[…tronqué]";
+  return { title, url, text };
+}
+
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- PDF support ----
+// When the active tab points to a PDF (Content-Type: application/pdf), the DOM
+// exposed by Chrome's built-in viewer is essentially empty, so extractPageContent
+// returns nothing. We instead fetch the bytes and parse the text layer with
+// pdf.js. The HTML path below stays unchanged for normal pages.
+const PDF_MAX = 16000;
+
+// Parse a PDF ArrayBuffer into up to PDF_MAX chars of text, using pdf.js loaded
+// in the side panel. Shared by both fetch paths below.
+async function parsePdfText(arrayBuffer) {
+  const pdfjsLib = window.pdfjsLib;
+  if (!pdfjsLib) throw new Error("pdf.js non chargé");
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    chrome.runtime.getURL("vendor/pdf.worker.min.js");
+
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  console.log("[PDF] parsé,", pdf.numPages, "page(s)");
+
+  let text = "";
+  for (let i = 1; i <= pdf.numPages && text.length < PDF_MAX; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map((it) => it.str).join(" ") + "\n\n";
+  }
+  if (text.length > PDF_MAX) text = text.slice(0, PDF_MAX) + "\n[…tronqué]";
+  return text;
+}
+
+// Fetch the PDF bytes FROM THE ACTIVE TAB'S PAGE CONTEXT (same-origin with the
+// PDF host). This is the key trick for bot-protected CDNs (e.g. ScienceDirect):
+// a fetch issued by the extension is cross-origin and flagged as automated, so
+// the CDN returns a "Security verification" JS challenge page instead of the
+// PDF. But the browser already passed that challenge during the tab's top-level
+// navigation (it executed the challenge JS, got a clearance cookie, reloaded).
+// A fetch injected into the tab is same-origin, carries that clearance cookie
+// automatically, and presents Sec-Fetch-Site: same-origin — so the CDN serves
+// the real PDF bytes. We then parse them with pdf.js in the side panel.
+//
+// Returns the extracted text if the tab serves a PDF, or `null` if it's not a
+// PDF (caller falls back to the DOM path). Throws on injection/parse failure.
+async function fetchPdfTextViaTab(tab) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: async () => {
+      const res = await fetch(location.href, { credentials: "same-origin" });
+      const ct = res.headers.get("content-type") || "";
+      const buf = await res.arrayBuffer();
+      return { ct, buf };
+    },
+  });
+  if (!result) return null;
+  const ct = (result.ct || "").toLowerCase();
+  console.log("[PDF via tab] HTTP", "(in-page)", "Content-Type:", ct || "(absent)", "octets:", result.buf?.byteLength);
+  if (!ct.includes("application/pdf")) {
+    console.log("[PDF via tab] pas un PDF -> repli");
+    return null;
+  }
+  return await parsePdfText(result.buf);
+}
+
+// Fallback: fetch the PDF bytes from the extension's side-panel context. This
+// works for plain (unprotected) PDF URLs, but bot-protected CDNs will return an
+// HTML challenge page here (see fetchPdfTextViaTab for why). credentials:
+// "include" sends the browser's cookies for the host; allowed because
+// host_permissions includes <all_urls>. We use GET (not HEAD) because many PDF
+// URLs are AWS S3 signed URLs whose SigV4 signature is bound to the HTTP method.
+//
+// Returns the extracted text if the URL serves a PDF, or `null` if it's not a
+// PDF. Throws on network/parse failure.
+async function fetchPdfTextViaExtension(url) {
+  const res = await fetch(url, { redirect: "follow", credentials: "include" });
+  if (!res.ok) throw new Error(`fetch ${res.status}`);
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  console.log("[PDF via ext] HTTP", res.status, "Content-Type:", ct || "(absent)");
+  if (!ct.includes("application/pdf")) {
+    let snippet = "";
+    try {
+      snippet = (await res.clone().text()).slice(0, 200).replace(/\s+/g, " ");
+    } catch (_) {}
+    console.log("[PDF via ext] pas un PDF. Extrait:", snippet);
+    return null;
+  }
+  const data = await res.arrayBuffer();
+  return await parsePdfText(data);
+}
+
+async function fetchPageContent() {
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) return null;
+  if (/^(chrome|edge|about|chrome-extension):/i.test(tab.url || "")) {
+    // Cannot inject into internal pages.
+    return { url: tab.url, title: tab.title, text: "" };
+  }
+
+  // PDF branch. Try the in-tab (same-origin) fetch first: it passes bot
+  // protection that blocks the extension's cross-origin fetch. If injection
+  // fails (e.g. the built-in PDF viewer is not injectable) or the response
+  // isn't a PDF, fall back to the extension-side fetch, then to the DOM path.
+  try {
+    const pdfText = await fetchPdfTextViaTab(tab);
+    if (pdfText !== null) {
+      return { url: tab.url, title: tab.title || "Document PDF", text: pdfText };
+    }
+  } catch (err) {
+    console.warn("[PDF via tab] échec injection:", err.message);
+  }
+  try {
+    const pdfText = await fetchPdfTextViaExtension(tab.url);
+    if (pdfText !== null) {
+      return { url: tab.url, title: tab.title || "Document PDF", text: pdfText };
+    }
+  } catch (err) {
+    console.warn("[PDF via ext] échec:", err.message);
+  }
+
+  async function run() {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: extractPageContent,
+    });
+    return result;
+  }
+
+  // SPAs (Next.js, React…) change the URL instantly but render content async.
+  // Retry a few times if the extracted text is suspiciously thin.
+  try {
+    let result = await run();
+    const MIN = 200;
+    for (let i = 0; i < 3 && (!result || result.text.length < MIN); i++) {
+      await sleep(450);
+      result = await run();
+    }
+    return result;
+  } catch (err) {
+    console.warn("extract failed:", err);
+    return { url: tab.url, title: tab.title, text: "" };
+  }
+}
+
+// ---- Live text selection from the active tab ----
+// The side panel and the page are separate documents, so the panel cannot see
+// window.getSelection() of the page directly. We poll the active tab's
+// selection periodically (only while the panel is open) and mirror it in a
+// preview box above the prompt. Polling (vs. an injected listener) follows tab
+// switches and reloads automatically without re-injection bookkeeping.
+const SELECTION_MAX = 8000;
+const SELECTION_PREVIEW = 150;
+
+function updateSelectionBox(text) {
+  currentSelection = (text || "").slice(0, SELECTION_MAX);
+  if (currentSelection) {
+    const preview = currentSelection.length > SELECTION_PREVIEW
+      ? currentSelection.slice(0, SELECTION_PREVIEW) + "…"
+      : currentSelection;
+    selectionTextEl.textContent = preview;
+    selectionBox.hidden = false;
+  } else {
+    selectionTextEl.textContent = "";
+    selectionBox.hidden = true;
+  }
+}
+
+async function pollSelectionOnce() {
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) return;
+  if (/^(chrome|edge|about|chrome-extension|file):/i.test(tab.url || "")) {
+    updateSelectionBox("");
+    return;
+  }
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => window.getSelection().toString(),
+    });
+    updateSelectionBox(result || "");
+  } catch (err) {
+    // No access to this tab (e.g. restricted page): leave the box as-is.
+  }
+}
+
+function startSelectionPolling() {
+  if (selectionPollTimer) return;
+  pollSelectionOnce();
+  selectionPollTimer = setInterval(pollSelectionOnce, 500);
+}
+
+function stopSelectionPolling() {
+  if (selectionPollTimer) {
+    clearInterval(selectionPollTimer);
+    selectionPollTimer = null;
+  }
+}
+
+// Clear button: remove the actual selection in the page so the next poll keeps
+// the box hidden, then hide locally for immediate feedback.
+selectionClear.addEventListener("click", async () => {
+  updateSelectionBox("");
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) return;
+  if (/^(chrome|edge|about|chrome-extension|file):/i.test(tab.url || "")) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => { const s = window.getSelection(); if (s) s.removeAllRanges(); },
+    });
+  } catch (err) {
+    // Ignore: box is already hidden locally.
+  }
+});
+
+// ---- Mistral call (streamed) ----
+// Builds the message array from the system prompt + the page context + the
+// conversation history. The latest user question is already in `history`
+// (pushed by send() before calling), so it must NOT be appended again here.
+function buildMessages() {
+  let sysContent =
+    "Tu es un assistant qui aide l'utilisateur à comprendre le contenu d'une page web ou d'une page de résultats de recherche. " +
+    "Réponds en français, de façon claire et concise. " +
+    "Base-toi principalement sur le contenu fourni ci-dessous (page courante). " +
+    "Si l'information n'est pas présente, dis-le et réponds à partir de tes connaissances générales en le précisant.";
+
+  if (currentSelection) {
+    sysContent +=
+      "\n\nL'utilisateur a sélectionné une zone de texte précise sur la page. " +
+      "Ta réponse doit porter prioritairement sur cette sélection ; utilise le reste du contenu de la page comme contexte pour l'expliquer ou la préciser.";
+    sysContent +=
+      "\n\n===== SÉLECTION DE L'UTILISATEUR (zone ciblée) =====\n" +
+      "--------------------------------------\n" +
+      `${currentSelection}\n` +
+      "======================================";
+  }
+
+  if (lastContext && lastContext.text) {
+    sysContent +=
+      "\n\n" +
+      `===== CONTENU DE LA PAGE COURANTE =====\n` +
+      `Titre : ${lastContext.title || "(sans titre)"}\n` +
+      `URL : ${lastContext.url || "(inconnue)"}\n` +
+      `--------------------------------------\n` +
+      `${lastContext.text}\n` +
+      `======================================`;
+  }
+
+  const msgs = [{ role: "system", content: sysContent }];
+  for (const m of history) msgs.push({ role: m.role, content: m.content });
+  return msgs;
+}
+
+async function streamMistral(question) {
+  const useReasoning = reasoningEnabled && modelSupportsReasoning(currentModel);
+  const body = {
+    model: currentModel,
+    messages: buildMessages(),
+    stream: true,
+    temperature: 0.3,
+    // Reasoning tokens are produced before the answer and count toward the
+    // completion budget, so give some headroom when enabled.
+    max_tokens: useReasoning ? 8000 : 3000,
+  };
+  if (useReasoning) body.reasoning_effort = "high";
+
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const err = await res.json();
+      if (err && err.message) detail = err.message;
+    } catch (_) {}
+    if (res.status === 401) {
+      addError("Clé API invalide ou expirée. Cliquez sur l'engrenage pour la mettre à jour.");
+      openKeyDialog(true);
+    } else {
+      addError(`Erreur Mistral (${detail}). Réessayez.`);
+    }
+    return null;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let full = "";
+  let thinking = "";
+  let inThinking = false;
+
+  // Build the bubble: a (hidden until used) reasoning block + an answer block.
+  const { thinkingEl, thinkingContent, answerEl } = addAssistantBubble();
+  answerEl.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>';
+
+  // End the reasoning phase: reveal the block (if any trace was produced).
+  function endThinking() {
+    if (!inThinking) return;
+    inThinking = false;
+    if (thinking) {
+      thinkingEl.hidden = false;
+      thinkingContent.textContent = thinking;
+    }
+  }
+
+  function appendAnswer(text) {
+    if (!text) return;
+    if (!full) answerEl.innerHTML = "";
+    full += text;
+    answerEl.innerHTML = renderMarkdown(full);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function appendThinking(text) {
+    if (!text) return;
+    if (!inThinking) {
+      inThinking = true;
+      thinkingEl.hidden = false;
+    }
+    thinking += text;
+    thinkingContent.textContent = thinking;
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        const json = JSON.parse(payload);
+        const delta = json.choices?.[0]?.delta;
+
+        // New-style reasoning (mistral-small/medium with reasoning_effort):
+        // delta.content is either a string (answer phase) or a list of typed
+        // chunks (ThinkChunk / TextChunk).
+        const content = delta?.content;
+        if (typeof content === "string") {
+          endThinking();
+          appendAnswer(content);
+        } else if (Array.isArray(content)) {
+          for (const chunk of content) {
+            if (!chunk || typeof chunk !== "object") continue;
+            if (chunk.type === "thinking" && Array.isArray(chunk.thinking)) {
+              for (const inner of chunk.thinking) {
+                if (inner && inner.type === "text" && inner.text) appendThinking(inner.text);
+              }
+            } else if (chunk.type === "text" && chunk.text) {
+              endThinking();
+              appendAnswer(chunk.text);
+            }
+          }
+        }
+
+        // Legacy fallback: some models expose the trace as reasoning_content.
+        if (delta?.reasoning_content) {
+          appendThinking(delta.reasoning_content);
+        }
+      } catch (_) {
+        // ignore partial json
+      }
+    }
+  }
+
+  endThinking();
+  if (!full) answerEl.textContent = "(réponse vide)";
+  return { answer: full, reasoning: thinking };
+}
+
+// ---- Send ----
+async function send() {
+  if (inFlight) return;
+  const question = promptInput.value.trim();
+  if (!question) return;
+
+  if (!apiKey) {
+    openKeyDialog(false);
+    return;
+  }
+
+  // Grab fresh page content and selection for this question.
+  lastContext = await fetchPageContent();
+  await pollSelectionOnce(); // refresh currentSelection so it matches the page at send time
+
+  setBusy(true);
+  // Clear the welcome placeholder on the first message of a fresh chat.
+  if (history.length === 0) chatEl.innerHTML = "";
+  addMsg("user", question);
+  history.push({ role: "user", content: question });
+  promptInput.value = "";
+
+  try {
+    if (lastContext && lastContext.text) {
+      const lenK = Math.round(lastContext.text.length / 1000);
+      addContextChip(`${lastContext.title || lastContext.url} · ${lenK}k car.`);
+    } else {
+      addContextChip(`${(lastContext && (lastContext.title || lastContext.url)) || "page inconnue"} · contenu indisponible`);
+      addSystem("Aucun contenu de page détecté. Le modèle répondra sans contexte de page (page interne, ou contenu non encore chargé).");
+    }
+    const result = await streamMistral(question);
+    if (result && result.answer) {
+      history.push({
+        role: "assistant",
+        content: result.answer,
+        reasoning: result.reasoning || "",
+      });
+      await syncCurrentConversation();
+    } else {
+      // Remove the unanswered user turn so retry is clean.
+      history.pop();
+    }
+  } catch (err) {
+    addError("Échec réseau. Vérifiez votre connexion et réessayez.");
+    console.error(err);
+    history.pop();
+  } finally {
+    setBusy(false);
+    promptInput.focus();
+  }
+}
+
+sendBtn.addEventListener("click", send);
+promptInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+promptInput.addEventListener("input", () => {
+  promptInput.style.height = "auto";
+  promptInput.style.height = Math.min(promptInput.scrollHeight, 120) + "px";
+});
+
+// ---- Init ----
+(async function init() {
+  await loadSettings();
+  await loadConversations();
+  // Start on a fresh conversation by default (previous context may be stale).
+  currentConvId = null;
+  history = [];
+  if (!apiKey) {
+    addSystem("Bienvenue dans Web AI Assistant. Ajoutez votre clé API Mistral pour commencer.");
+    openKeyDialog(false);
+  } else {
+    addSystem("Nouvelle conversation. Posez une question sur la page courante.");
+  }
+  // Mirror the active tab's text selection in the preview box while open.
+  startSelectionPolling();
+})();
+
+// Stop polling when the side panel is closed/unloaded.
+window.addEventListener("pagehide", stopSelectionPolling);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopSelectionPolling();
+  else startSelectionPolling();
+});
