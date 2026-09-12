@@ -2,6 +2,195 @@
 
 ---
 
+## 2026-09-12 — Ajout du mode Transcription (speech-to-text avec diarisation)
+
+### Contexte et objectif
+
+L'extension permettait jusqu'à présent de poser des questions à un modèle de
+langage Mistral en prenant pour contexte la page web ouverte dans l'onglet
+actif. L'objectif de cette modification est d'ajouter une seconde
+fonctionnalité : la transcription speech-to-text de l'audio de la vidéo jouée
+dans l'onglet actif, en utilisant le modèle Voxtral Mini Transcribe 2 de
+Mistral, avec option de diarisation (identification des locuteurs).
+
+La clé API Mistral déjà implémentée pour le chat (stockée dans
+`chrome.storage.local` sous `mistralApiKey`) est réutilisée telle quelle pour
+le endpoint de transcription — les deux API partagent la même
+authentification `Bearer`.
+
+### Fonctionnalités apportées
+
+1. **Toggle de mode (Chat / Transcription)**
+   Un bouton segmenté en haut du panneau latéral permet de basculer entre le
+   mode Chat (questionnement du LLM sur le contenu de la page) et le mode
+   Transcription (enregistrement et transcription de l'audio de l'onglet).
+   L'état est persisté dans `chrome.storage.local` (clé `mistralMode`) et
+   restauré à l'ouverture.
+
+2. **Barre d'outils contextuelle par mode**
+   En mode Chat : « Nouvelle conversation », « Historique des conversations »
+   et « Paramètres (clé API) ». En mode Transcription : « Nouvelle
+   transcription », « Historique des transcriptions » et « Paramètres (clé
+   API) ». Les boutons inactifs sont masqués via l'attribut `hidden`.
+
+3. **Capture audio de l'onglet via `getDisplayMedia()`**
+   L'enregistrement utilise `navigator.mediaDevices.getDisplayMedia({ video:
+   true, audio: true })`, déclenché par le clic utilisateur sur « Démarrer ».
+   Une boîte de dialogue système permet à l'utilisateur de sélectionner
+   l'onglet à partager et de cocher « Partager l'audio ». Les pistes vidéo
+   sont immédiatement arrêtées ; seul l'audio est conservé. L'audio continue
+   de jouer normalement dans l'onglet pendant l'enregistrement (pas de
+   routage AudioContext nécessaire).
+
+   Cette approche a été choisie après l'échec de `chrome.tabCapture.getMediaStreamId()`,
+   qui exige une permission `activeTab` temporaire (accordée au moment du clic
+   sur l'icône de l'extension, mais expirée au moment du clic sur « Démarrer »
+   dans le panneau latéral). `getDisplayMedia` ne dépend que du geste
+   utilisateur immédiat.
+
+4. **Enregistrement avec `MediaRecorder`**
+   L'audio capturé est enregistré au format `audio/webm;codecs=opus` (ou
+   `audio/webm` en repli) par `MediaRecorder`, avec collecte des chunks
+   toutes les secondes. Un timer en direct affiche la durée écoulée. La
+   limite Voxtral de 3 heures est appliquée comme garde-fou. Si
+   l'utilisateur arrête le partage via le contrôle natif de Chrome, le
+   recording s'arrête proprement.
+
+5. **Transcription via l'API Mistral**
+   Le blob audio est envoyé en `multipart/form-data` au endpoint
+   `POST /v1/audio/transcriptions` avec le modèle `voxtral-mini-latest`.
+   Quand la diarisation est activée, les paramètres `diarize=true` et
+   `timestamp_granularities=["segment"]` sont envoyés (la langue n'est pas
+   envoyée dans ce cas, l'API ne permettant pas les deux simultanément).
+   Sinon, la langue sélectionnée (si non « auto ») est envoyée via le
+   paramètre `language`.
+
+6. **Diarisation**
+   Un toggle « Diarisation » (persisté dans `mistralDiarize`) active la
+   séparation des locuteurs. Les segments retournés par l'API (champs
+   `speaker` et `text`) sont affichés avec des étiquettes de locuteur
+   colorées. Sans diarisation, seul le texte brut est affiché.
+
+7. **Sélecteur de langue**
+   Un sélecteur propose 13 langues supportées par Voxtral (français, anglais,
+   espagnol, allemand, italien, portugais, néerlandais, russe, arabe, chinois,
+   japonais, coréen, hindi) plus une option « auto » (détection automatique).
+   Le choix est persisté dans `mistralSTTLang`.
+
+8. **Affichage des transcriptions**
+   Chaque transcription affiche un en-tête avec la durée, la langue détectée,
+   le mode (diarisation ou non), et un bouton « Copier ». Le contenu est soit
+   une liste de segments avec locuteurs (diarisation), soit le texte brut.
+
+9. **Historique des transcriptions séparé**
+   Un panneau d'historique dédié (clé de stockage `transcriptions` dans
+   `chrome.storage.local`) conserve les transcriptions de manière totalement
+   indépendante des conversations chat (clé `conversations`). Chaque
+   transcription enregistre : `{ id, title, createdAt, duration, language,
+   diarized, text, segments }`. L'utilisateur peut rouvrir, supprimer ou
+   tout effacer. La limite est de 200 transcriptions.
+
+10. **Correction CSS de l'attribut `hidden`**
+    Une règle globale `[hidden] { display: none !important; }` a été ajoutée
+    pour garantir que l'attribut `hidden` l'emporte sur les classes CSS
+    utilisant `display: flex` (`.chat`, `.controls`, `.composer`). Sans cette
+    correction, les contrôles et zones des deux modes étaient visibles
+    simultanément.
+
+### Fichiers modifiés
+
+#### `manifest.json`
+- Ajout de la permission `tabCapture` (nécessaire même si l'approche finale
+  utilise `getDisplayMedia`, car le manifeste doit déclarer l'intention de
+  capture).
+- Mise à jour de la description pour mentionner la transcription audio.
+
+#### `sidepanel.html`
+- Ajout d'un toggle de mode segmenté (`.mode-toggle` avec deux boutons
+  `data-mode="chat"` et `data-mode="stt"`).
+- Séparation de la barre d'outils en deux groupes : `#chatActions` (Nouvelle
+  conversation, Historique, Paramètres) et `#sttActions` (Nouvelle
+  transcription, Historique des transcriptions, Paramètres).
+- Section `#chatControls` (modèle + réflexion) et `#sttControls` (diarisation
+  + langue) séparées et basculées par mode.
+- Zone `#sttArea` pour l'affichage des transcriptions, parallèle à `#chat`.
+- Footer `#sttComposer` avec boutons Démarrer/Arrêter et timer.
+- Panneau `#sttHistoryPanel` dédié à l'historique des transcriptions.
+
+#### `sidepanel.css`
+- Règle globale `[hidden] { display: none !important; }` pour forcer le masquage.
+- Styles du toggle de mode (`.mode-toggle`, `.mode-btn`).
+- Styles des boutons d'enregistrement (`.record-btn`, `.record-btn.stop`).
+- Styles du timer d'enregistrement (`.record-timer` avec animation de pulse).
+- Styles du résultat de transcription (`.stt-result`, `.stt-result-header`,
+  `.stt-result-meta`, `.stt-copy-btn`).
+- Styles des segments diarisés (`.stt-segments`, `.stt-segment`, `.stt-speaker`,
+  `.stt-segment-text`).
+
+#### `sidepanel.js`
+- Nouvelles constantes : `STT_API_URL`, `STT_MODEL`.
+- Nouvel état STT : `currentMode`, `diarizeEnabled`, `transcribeLanguage`,
+  `isRecording`, `mediaRecorder`, `audioStream`, `recordedChunks`,
+  `recordStartTime`, `recordTimerInterval`, `MAX_RECORD_SECONDS`.
+- Nouvel état historique STT : `transcriptions`, `currentTranscriptionId`,
+  `MAX_TRANSCRIPTIONS`.
+- Nouvelles références DOM pour tous les éléments STT.
+- `loadSettings()` étendu pour charger `mistralDiarize`, `mistralSTTLang`,
+  `mistralMode`.
+- Nouvelle fonction `applyMode()` : bascule la visibilité de tous les
+  éléments entre les deux modes.
+- Nouvelles fonctions d'enregistrement : `startRecording()` (getDisplayMedia +
+  MediaRecorder), `stopRecording()`, `handleRecordingStop()`,
+  `cleanupRecording()`, `updateRecordTimer()`, `formatDuration()`.
+- Nouvelle fonction `transcribeAudio(blob)` : envoie le blob à l'API Mistral.
+- Nouvelle fonction `displayTranscription(result, duration, diarizedOverride)`
+  : affiche le résultat avec segments diarisés ou texte brut.
+- Nouvelles fonctions d'historique STT : `loadTranscriptions()`,
+  `persistTranscriptions()`, `saveTranscription()`,
+  `startNewTranscription()`, `openTranscription()`,
+  `deleteTranscription()`, `clearAllTranscriptions()`,
+  `renderSTTHistoryList()`, `openSTTHistory()`, `closeSTTHistory()`,
+  `deriveTranscriptionTitle()`.
+- Nouvelles fonctions d'affichage STT : `addSTTMessage()`, `addSTTStatus()`,
+  `addSTTError()`, `clearSTTStatusMessages()`.
+- `init()` étendu pour appeler `loadTranscriptions()` et afficher le message
+  de bienvenue STT.
+- Gestion du nettoyage à la fermeture : arrêt du recording et du polling.
+
+#### `background.js`
+- Aucune modification finale (le relais de messages `get-stream-id` ajouté
+  temporairement pour `tabCapture` a été retiré, l'approche `getDisplayMedia`
+  ne nécessitant pas de service worker).
+
+### Comportement par défaut
+
+Le mode par défaut est « Chat » (comportement inchangé pour les utilisateurs
+existants). Le mode « Transcription » doit être explicitement sélectionné.
+Tous les préférences STT (diarisation, langue, mode) sont persistées entre
+les sessions. La clé API est partagée entre les deux modes.
+
+### Limites connues
+
+- **Boîte de dialogue de partage** : `getDisplayMedia` affiche une boîte de
+  dialogue système à chaque démarrage d'enregistrement. L'utilisateur doit
+  sélectionner l'onglet et cocher « Partager l'audio ». C'est le prix de la
+  simplicité et de la fiabilité (pas de gestion de permission `activeTab`
+  temporaire).
+- **Validation non effectuée dans Chrome réel** : la syntaxe JavaScript a été
+  validée par `node --check`, mais le flux complet (getDisplayMedia →
+  MediaRecorder → transcription → affichage) n'a pas été testé dans un
+  navigateur. Un test manuel est nécessaire.
+- **Format audio** : MediaRecorder produit du `audio/webm`. L'API Mistral est
+  supposée accepter ce format, mais cela n'a pas été vérifié empiriquement.
+- **Schéma des segments de diarisation** : le code suppose que les segments
+  retournés par l'API contiennent des champs `speaker` et `text`. Si le
+  schéma réel diffère (par ex. `speaker_id`), un ajustement sera nécessaire
+  dans `displayTranscription`.
+- **Historique non testé** : la persistance et la réouverture des
+  transcriptions depuis l'historique n'ont pas été validées dans Chrome.
+
+---
+
 ## 2026-09-12 — Rendu Markdown des réponses de l'assistant
 
 ### Contexte et objectif

@@ -3,6 +3,8 @@
 // The API key lives in chrome.storage.local (never hardcoded).
 
 const API_URL = "https://api.mistral.ai/v1/chat/completions";
+const STT_API_URL = "https://api.mistral.ai/v1/audio/transcriptions";
+const STT_MODEL = "voxtral-mini-latest";
 const MODEL_LABELS = {
   "mistral-small-latest": "Mistral Small 4",
   "mistral-medium-latest": "Mistral Medium 3.5",
@@ -25,6 +27,25 @@ let conversations = [];
 let currentConvId = null; // null when the current view is a fresh, unsaved chat
 
 const MAX_CONVERSATIONS = 200;
+
+// ---- Speech-to-Text state ----
+let currentMode = "chat"; // "chat" | "stt"
+let diarizeEnabled = false;
+let transcribeLanguage = ""; // "" = auto-detect
+let isRecording = false;
+let mediaRecorder = null;
+let audioStream = null;
+let audioContext = null; // routes tab audio back to the user's speakers
+let recordedChunks = [];
+let recordStartTime = 0;
+let recordTimerInterval = null;
+const MAX_RECORD_SECONDS = 3 * 3600; // Voxtral limit: 3 hours
+
+// ---- STT history state ----
+// Array of { id, title, createdAt, duration, language, diarized, text, segments }
+let transcriptions = [];
+let currentTranscriptionId = null;
+const MAX_TRANSCRIPTIONS = 200;
 
 // ---- DOM ----
 const chatEl = document.getElementById("chat");
@@ -51,6 +72,29 @@ const historyClear = document.getElementById("historyClear");
 const selectionBox = document.getElementById("selectionBox");
 const selectionTextEl = document.getElementById("selectionText");
 const selectionClear = document.getElementById("selectionClear");
+
+// ---- STT DOM ----
+const modeBtns = document.querySelectorAll(".mode-btn");
+const chatActions = document.getElementById("chatActions");
+const sttActions = document.getElementById("sttActions");
+const chatControls = document.getElementById("chatControls");
+const sttControls = document.getElementById("sttControls");
+const sttArea = document.getElementById("sttArea");
+const chatComposer = document.getElementById("chatComposer");
+const sttComposer = document.getElementById("sttComposer");
+const diarizeToggle = document.getElementById("diarizeToggle");
+const diarizeToggleWrap = document.getElementById("diarizeToggleWrap");
+const langSelect = document.getElementById("langSelect");
+const recordBtn = document.getElementById("recordBtn");
+const stopRecordBtn = document.getElementById("stopRecordBtn");
+const recordTimer = document.getElementById("recordTimer");
+const newTranscriptionBtn = document.getElementById("newTranscriptionBtn");
+const sttHistoryBtn = document.getElementById("sttHistoryBtn");
+const sttSettingsBtn = document.getElementById("sttSettingsBtn");
+const sttHistoryPanel = document.getElementById("sttHistoryPanel");
+const sttHistoryList = document.getElementById("sttHistoryList");
+const sttHistoryClose = document.getElementById("sttHistoryClose");
+const sttHistoryClear = document.getElementById("sttHistoryClear");
 
 // ---- Helpers ----
 function escapeHtml(str) {
@@ -260,7 +304,10 @@ function setBusy(busy) {
 
 // ---- Storage ----
 async function loadSettings() {
-  const data = await chrome.storage.local.get(["mistralApiKey", "mistralModel", "mistralReasoning"]);
+  const data = await chrome.storage.local.get([
+    "mistralApiKey", "mistralModel", "mistralReasoning",
+    "mistralDiarize", "mistralSTTLang", "mistralMode",
+  ]);
   apiKey = data.mistralApiKey || "";
   currentModel = data.mistralModel || "mistral-small-latest";
   reasoningEnabled = !!data.mistralReasoning;
@@ -269,6 +316,13 @@ async function loadSettings() {
   }
   reasoningToggle.checked = reasoningEnabled;
   syncReasoningToggleAvailability();
+
+  diarizeEnabled = !!data.mistralDiarize;
+  diarizeToggle.checked = diarizeEnabled;
+  transcribeLanguage = data.mistralSTTLang || "";
+  langSelect.value = transcribeLanguage;
+  currentMode = data.mistralMode || "chat";
+  applyMode();
 }
 
 async function saveApiKey(key) {
@@ -310,6 +364,473 @@ reasoningToggle.addEventListener("change", async () => {
   reasoningToggle.checked = reasoningEnabled;
   await chrome.storage.local.set({ mistralReasoning: reasoningEnabled });
 });
+
+// ---- Mode switching (Chat / Transcription) ----
+function applyMode() {
+  const isSTT = currentMode === "stt";
+  modeBtns.forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === currentMode);
+  });
+  chatActions.hidden = isSTT;
+  sttActions.hidden = !isSTT;
+  chatControls.hidden = isSTT;
+  sttControls.hidden = !isSTT;
+  chatEl.hidden = isSTT;
+  sttArea.hidden = !isSTT;
+  chatComposer.hidden = isSTT;
+  sttComposer.hidden = !isSTT;
+
+  // Stop selection polling in STT mode (irrelevant, and avoids tab injection).
+  if (isSTT) stopSelectionPolling();
+  else startSelectionPolling();
+}
+
+modeBtns.forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    if (btn.dataset.mode === currentMode) return;
+    // Don't switch away while recording is in flight.
+    if (isRecording) return;
+    currentMode = btn.dataset.mode;
+    await chrome.storage.local.set({ mistralMode: currentMode });
+    applyMode();
+  });
+});
+
+// ---- STT settings persistence ----
+diarizeToggle.addEventListener("change", async () => {
+  diarizeEnabled = diarizeToggle.checked;
+  await chrome.storage.local.set({ mistralDiarize: diarizeEnabled });
+});
+
+langSelect.addEventListener("change", async () => {
+  transcribeLanguage = langSelect.value;
+  await chrome.storage.local.set({ mistralSTTLang: transcribeLanguage });
+});
+
+// ---- STT helpers ----
+function addSTTMessage(text, cls) {
+  const div = document.createElement("div");
+  div.className = `msg ${cls}`;
+  div.textContent = text;
+  sttArea.appendChild(div);
+  sttArea.scrollTop = sttArea.scrollHeight;
+  return div;
+}
+
+function addSTTStatus(text) {
+  return addSTTMessage(text, "system");
+}
+
+function addSTTError(text) {
+  return addSTTMessage(text, "error");
+}
+
+function clearSTTStatusMessages() {
+  sttArea.querySelectorAll(".msg.system, .msg.error").forEach((n) => n.remove());
+}
+
+function formatDuration(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function updateRecordTimer() {
+  const elapsed = Math.floor((Date.now() - recordStartTime) / 1000);
+  recordTimer.textContent = formatDuration(elapsed);
+  if (elapsed >= MAX_RECORD_SECONDS) {
+    stopRecording();
+    addSTTError("Limite de 3 heures atteinte. Enregistrement arrêté automatiquement.");
+  }
+}
+
+// ---- Tab audio capture ----
+// Uses navigator.mediaDevices.getDisplayMedia() to capture the tab's audio.
+// This shows a picker dialog where the user selects the tab to share. Unlike
+// chrome.tabCapture.getMediaStreamId(), this works from the side panel
+// because it only requires the user gesture from clicking "Démarrer" — no
+// activeTab grant timing is involved. The audio continues to play normally
+// in the tab while being captured, so no AudioContext routing is needed.
+async function startRecording() {
+  if (isRecording) return;
+  if (!apiKey) {
+    openKeyDialog(false);
+    return;
+  }
+
+  clearSTTStatusMessages();
+  addSTTStatus("Sélectionnez l'onglet contenant la vidéo et cochez « Partager l'audio ».");
+
+  try {
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+    });
+
+    // We only need the audio track(s).
+    const audioTracks = displayStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      displayStream.getTracks().forEach((t) => t.stop());
+      throw new Error("no-audio-track");
+    }
+
+    // Stop video tracks immediately — we only want audio.
+    displayStream.getVideoTracks().forEach((t) => t.stop());
+
+    // Build an audio-only stream for MediaRecorder.
+    audioStream = new MediaStream(audioTracks);
+
+    // If the user stops sharing via Chrome's native "Stop sharing" control,
+    // stop the recording gracefully.
+    audioTracks[0].addEventListener("ended", () => {
+      if (isRecording) stopRecording();
+    });
+
+    // Set up MediaRecorder.
+    recordedChunks = [];
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
+    mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.onstop = handleRecordingStop;
+    mediaRecorder.start(1000); // collect chunks every second
+
+    isRecording = true;
+    recordStartTime = Date.now();
+    recordTimerInterval = setInterval(updateRecordTimer, 1000);
+
+    // Update UI.
+    recordBtn.hidden = true;
+    stopRecordBtn.hidden = false;
+    recordTimer.hidden = false;
+    recordTimer.classList.add("recording");
+    recordTimer.textContent = "00:00";
+
+    clearSTTStatusMessages();
+    addSTTStatus("Enregistrement en cours… Cliquez sur Arrêter quand vous avez fini.");
+  } catch (err) {
+    console.error("Recording start failed:", err);
+    if (err.name === "NotAllowedError") {
+      addSTTError("Partage annulé. Cliquez sur « Démarrer » et choisissez l'onglet contenant la vidéo à transcrire.");
+    } else if (err.message === "no-audio-track") {
+      addSTTError("Aucune piste audio reçue. Cochez « Partager l'audio de l'onglet » dans la boîte de dialogue de sélection.");
+    } else {
+      addSTTError("Échec du démarrage de l'enregistrement : " + (err.message || err));
+    }
+    cleanupRecording();
+  }
+}
+
+function stopRecording() {
+  if (!isRecording) return;
+  isRecording = false;
+
+  if (recordTimerInterval) {
+    clearInterval(recordTimerInterval);
+    recordTimerInterval = null;
+  }
+
+  recordBtn.hidden = false;
+  stopRecordBtn.hidden = true;
+  recordTimer.hidden = true;
+  recordTimer.classList.remove("recording");
+
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  }
+}
+
+async function handleRecordingStop() {
+  const duration = (Date.now() - recordStartTime) / 1000;
+  cleanupRecording();
+
+  if (recordedChunks.length === 0) {
+    addSTTError("Aucun audio enregistré. Lancez la lecture de la vidéo avant de démarrer l'enregistrement.");
+    return;
+  }
+
+  const blob = new Blob(recordedChunks, { type: "audio/webm" });
+  const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
+  console.log(`[STT] Enregistrement : ${duration.toFixed(0)}s, ${sizeMB} MB`);
+
+  if (blob.size < 1000) {
+    addSTTError("L'audio enregistré est trop court. Assurez-vous que la vidéo émet du son.");
+    return;
+  }
+
+  clearSTTStatusMessages();
+  addSTTStatus("Transcription en cours…");
+
+  try {
+    const result = await transcribeAudio(blob);
+    clearSTTStatusMessages();
+    displayTranscription(result, duration);
+    await saveTranscription(result, duration);
+  } catch (err) {
+    clearSTTStatusMessages();
+    addSTTError("Échec de la transcription : " + (err.message || err));
+    console.error(err);
+  }
+}
+
+function cleanupRecording() {
+  if (audioStream) {
+    audioStream.getTracks().forEach((t) => t.stop());
+    audioStream = null;
+  }
+  if (audioContext) {
+    try { audioContext.close(); } catch (_) {}
+    audioContext = null;
+  }
+  mediaRecorder = null;
+}
+
+// ---- Mistral transcription API call ----
+// Sends the recorded audio blob as multipart/form-data to the
+// /v1/audio/transcriptions endpoint. When diarization is enabled, the
+// `diarize` and `timestamp_granularities` parameters are sent; the language
+// parameter is omitted in that case (the API does not allow both).
+async function transcribeAudio(blob) {
+  const formData = new FormData();
+  formData.append("model", STT_MODEL);
+  formData.append("file", blob, "audio.webm");
+
+  if (diarizeEnabled) {
+    formData.append("diarize", "true");
+    formData.append("timestamp_granularities", "segment");
+  } else if (transcribeLanguage) {
+    formData.append("language", transcribeLanguage);
+  }
+
+  const res = await fetch(STT_API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: formData,
+  });
+
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const err = await res.json();
+      if (err && err.message) detail = err.message;
+    } catch (_) {}
+    if (res.status === 401) {
+      addSTTError("Clé API invalide ou expirée. Cliquez sur l'engrenage pour la mettre à jour.");
+      openKeyDialog(true);
+    }
+    throw new Error(detail);
+  }
+
+  return await res.json();
+}
+
+// ---- Transcription display ----
+// `diarizedOverride` is used when re-opening a saved transcription from
+// history (the current `diarizeEnabled` state may have changed since).
+function displayTranscription(result, duration, diarizedOverride) {
+  const showDiarized = diarizedOverride !== undefined ? diarizedOverride : diarizeEnabled;
+  const div = document.createElement("div");
+  div.className = "stt-result";
+
+  // Header: metadata + copy button.
+  const header = document.createElement("div");
+  header.className = "stt-result-header";
+  const meta = document.createElement("div");
+  meta.className = "stt-result-meta";
+  const parts = [formatDuration(duration)];
+  if (result.language) parts.push(`Langue : ${result.language}`);
+  if (showDiarized) parts.push("Diarisation");
+  meta.textContent = parts.join(" · ");
+
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "stt-copy-btn";
+  copyBtn.textContent = "Copier";
+  copyBtn.addEventListener("click", () => {
+    navigator.clipboard.writeText(result.text || "").then(() => {
+      copyBtn.textContent = "Copié";
+      copyBtn.classList.add("copied");
+      setTimeout(() => {
+        copyBtn.textContent = "Copier";
+        copyBtn.classList.remove("copied");
+      }, 2000);
+    });
+  });
+
+  header.appendChild(meta);
+  header.appendChild(copyBtn);
+  div.appendChild(header);
+
+  // Content: diarized segments or plain text.
+  if (showDiarized && Array.isArray(result.segments) && result.segments.length > 0) {
+    const segContainer = document.createElement("div");
+    segContainer.className = "stt-segments";
+    for (const seg of result.segments) {
+      const segDiv = document.createElement("div");
+      segDiv.className = "stt-segment";
+      const speaker = document.createElement("div");
+      speaker.className = "stt-speaker";
+      speaker.textContent = seg.speaker || "Locuteur";
+      const text = document.createElement("div");
+      text.className = "stt-segment-text";
+      text.textContent = (seg.text || "").trim();
+      segDiv.appendChild(speaker);
+      segDiv.appendChild(text);
+      segContainer.appendChild(segDiv);
+    }
+    div.appendChild(segContainer);
+  } else {
+    const textDiv = document.createElement("div");
+    textDiv.textContent = result.text || "(transcription vide)";
+    div.appendChild(textDiv);
+  }
+
+  sttArea.appendChild(div);
+  sttArea.scrollTop = sttArea.scrollHeight;
+}
+
+// ---- STT event wiring ----
+recordBtn.addEventListener("click", startRecording);
+stopRecordBtn.addEventListener("click", stopRecording);
+
+// ---- STT history persistence ----
+function deriveTranscriptionTitle(text) {
+  const t = (text || "Transcription").trim();
+  return t.length > 48 ? t.slice(0, 48) + "…" : t;
+}
+
+async function loadTranscriptions() {
+  const data = await chrome.storage.local.get("transcriptions");
+  transcriptions = Array.isArray(data.transcriptions) ? data.transcriptions : [];
+}
+
+async function persistTranscriptions() {
+  transcriptions.sort((a, b) => b.createdAt - a.createdAt);
+  if (transcriptions.length > MAX_TRANSCRIPTIONS) {
+    transcriptions = transcriptions.slice(0, MAX_TRANSCRIPTIONS);
+  }
+  await chrome.storage.local.set({ transcriptions });
+}
+
+async function saveTranscription(result, duration) {
+  const record = {
+    id: genId(),
+    title: deriveTranscriptionTitle(result.text),
+    createdAt: Date.now(),
+    duration: duration,
+    language: result.language || "",
+    diarized: diarizeEnabled,
+    text: result.text || "",
+    segments: (diarizeEnabled && Array.isArray(result.segments)) ? result.segments : [],
+  };
+  currentTranscriptionId = record.id;
+  transcriptions.unshift(record);
+  await persistTranscriptions();
+}
+
+function startNewTranscription() {
+  currentTranscriptionId = null;
+  sttArea.innerHTML = "";
+  closeSTTHistory();
+  addSTTStatus(
+    "Lancez la lecture de la vidéo dans l'onglet actif, puis cliquez sur « Démarrer » pour enregistrer son audio et le transcrire."
+  );
+}
+
+async function openTranscription(id) {
+  const t = transcriptions.find((c) => c.id === id);
+  if (!t) return;
+  currentTranscriptionId = id;
+  sttArea.innerHTML = "";
+  // Rebuild the transcription display from stored data.
+  displayTranscription(
+    { text: t.text, language: t.language, segments: t.segments },
+    t.duration,
+    t.darized
+  );
+  closeSTTHistory();
+}
+
+async function deleteTranscription(id) {
+  transcriptions = transcriptions.filter((c) => c.id !== id);
+  if (currentTranscriptionId === id) {
+    startNewTranscription();
+  }
+  await persistTranscriptions();
+  renderSTTHistoryList();
+}
+
+async function clearAllTranscriptions() {
+  transcriptions = [];
+  currentTranscriptionId = null;
+  startNewTranscription();
+  await chrome.storage.local.set({ transcriptions: [] });
+  renderSTTHistoryList();
+}
+
+function renderSTTHistoryList() {
+  sttHistoryList.innerHTML = "";
+  if (transcriptions.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "Aucune transcription enregistrée.";
+    sttHistoryList.appendChild(empty);
+    return;
+  }
+  for (const t of transcriptions) {
+    const item = document.createElement("div");
+    item.className = "history-item" + (t.id === currentTranscriptionId ? " active" : "");
+    item.dataset.id = t.id;
+
+    const main = document.createElement("div");
+    main.className = "history-item-main";
+    const titleEl = document.createElement("div");
+    titleEl.className = "history-item-title";
+    titleEl.textContent = t.title || "Sans titre";
+    const meta = document.createElement("div");
+    meta.className = "history-item-meta";
+    const metaParts = [fmtDate(t.createdAt), formatDuration(t.duration || 0)];
+    if (t.darized) metaParts.push("Diarisation");
+    if (t.language) metaParts.push(t.language);
+    meta.textContent = metaParts.join(" · ");
+    main.appendChild(titleEl);
+    main.appendChild(meta);
+
+    const del = document.createElement("button");
+    del.className = "history-del";
+    del.title = "Supprimer";
+    del.textContent = "✕";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await deleteTranscription(t.id);
+    });
+
+    item.appendChild(main);
+    item.appendChild(del);
+    item.addEventListener("click", () => openTranscription(t.id));
+    sttHistoryList.appendChild(item);
+  }
+}
+
+function openSTTHistory() {
+  renderSTTHistoryList();
+  sttHistoryPanel.hidden = false;
+}
+function closeSTTHistory() {
+  sttHistoryPanel.hidden = true;
+}
+
+newTranscriptionBtn.addEventListener("click", startNewTranscription);
+sttHistoryBtn.addEventListener("click", openSTTHistory);
+sttHistoryClose.addEventListener("click", closeSTTHistory);
+sttHistoryClear.addEventListener("click", async () => {
+  if (confirm("Supprimer toutes les transcriptions enregistrées ?")) {
+    await clearAllTranscriptions();
+  }
+});
+sttSettingsBtn.addEventListener("click", () => openKeyDialog(true));
 
 // ---- Conversation persistence ----
 function genId() {
@@ -1008,6 +1529,7 @@ promptInput.addEventListener("input", () => {
 (async function init() {
   await loadSettings();
   await loadConversations();
+  await loadTranscriptions();
   // Start on a fresh conversation by default (previous context may be stale).
   currentConvId = null;
   history = [];
@@ -1017,13 +1539,24 @@ promptInput.addEventListener("input", () => {
   } else {
     addSystem("Nouvelle conversation. Posez une question sur la page courante.");
   }
-  // Mirror the active tab's text selection in the preview box while open.
-  startSelectionPolling();
+  // STT welcome message.
+  addSTTStatus(
+    "Lancez la lecture de la vidéo dans l'onglet actif, puis cliquez sur « Démarrer » pour enregistrer son audio et le transcrire."
+  );
+  // Mirror the active tab's text selection in the preview box while open
+  // (only relevant in chat mode).
+  if (currentMode === "chat") startSelectionPolling();
 })();
 
 // Stop polling when the side panel is closed/unloaded.
-window.addEventListener("pagehide", stopSelectionPolling);
+window.addEventListener("pagehide", () => {
+  stopSelectionPolling();
+  if (isRecording) stopRecording();
+});
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopSelectionPolling();
-  else startSelectionPolling();
+  if (document.hidden) {
+    stopSelectionPolling();
+  } else if (currentMode === "chat") {
+    startSelectionPolling();
+  }
 });

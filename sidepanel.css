@@ -26,6 +26,10 @@
 
 * { box-sizing: border-box; }
 
+/* Ensure the HTML hidden attribute always wins over display:flex/other
+   display values set by class-based rules (.chat, .controls, .composer…). */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -65,6 +69,34 @@ body {
   cursor: pointer;
 }
 .icon-btn:hover { background: var(--bubble-ai); color: var(--fg); }
+
+/* Mode toggle (Chat / Transcription) */
+.mode-toggle {
+  display: flex;
+  gap: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.mode-btn {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.mode-btn:first-child { border-radius: 8px 0 0 8px; }
+.mode-btn:last-child { border-radius: 0 8px 8px 0; border-left: none; }
+.mode-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
 
 /* Model selector */
 .controls {
@@ -560,3 +592,138 @@ body {
   font-size: 12px;
 }
 .history-clear:hover { color: var(--danger); border-color: var(--danger); }
+
+/* ---- Speech-to-Text mode ---- */
+
+.stt-area {
+  gap: 12px;
+}
+
+/* Recording controls footer */
+.stt-composer {
+  gap: 10px;
+}
+.stt-composer[hidden] { display: none; }
+
+.stt-record-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.record-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.12s ease;
+}
+.record-btn:hover { filter: brightness(1.05); }
+.record-btn:disabled { opacity: 0.4; cursor: default; }
+.record-btn.stop {
+  background: var(--danger);
+}
+
+.record-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--danger);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.record-timer.recording {
+  animation: pulse-rec 1.5s ease-in-out infinite;
+}
+@keyframes pulse-rec {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Recording status indicator */
+.stt-status {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.stt-status .rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: pulse-rec 1.5s ease-in-out infinite;
+}
+
+/* Transcription output */
+.stt-result {
+  align-self: stretch;
+  background: var(--bubble-ai);
+  color: var(--bubble-ai-fg);
+  border-radius: 14px;
+  padding: 12px 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.stt-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.stt-result-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+.stt-copy-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.stt-copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+.stt-copy-btn.copied { color: var(--accent); border-color: var(--accent); }
+
+/* Diarized segments */
+.stt-segments { display: flex; flex-direction: column; gap: 8px; }
+.stt-segment {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.stt-speaker {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  margin-top: 1px;
+}
+.stt-segment-text {
+  flex: 1 1 auto;
+  line-height: 1.5;
+}
