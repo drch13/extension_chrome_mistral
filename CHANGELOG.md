@@ -16,20 +16,21 @@ mais l'étiquette du locuteur restait générique.
 Dans `displayTranscription()` (`sidepanel.js`), l'étiquette du locuteur lisait
 `seg.speaker`, champ inexistant dans la réponse de l'API Mistral
 `/v1/audio/transcriptions`. Celle-ci renvoie en réalité `speaker_id`
-(valeurs `speaker_0`, `speaker_1`, …). L'expression `undefined || "Locuteur"`
+(valeurs `speaker_1`, `speaker_2`, …). L'expression `undefined || "Locuteur"`
 retombait donc toujours sur le fallback.
 
-La ligne est corrigée pour lire `seg.speaker_id`, convertir l'indice en label
-lisible (`speaker_0` → « Locuteur 1 », `speaker_1` → « Locuteur 2 »), et
-conserver `seg.speaker` comme fallback pour les enregistrements déjà
-sauvegardés dans l'historique (qui ne contiennent pas `speaker_id`).
+La ligne est corrigée pour lire `seg.speaker_id` et afficher directement le
+numéro extrait (`speaker_1` → « Locuteur 1 », `speaker_2` → « Locuteur 2 »),
+sans décalage d'indexation. Le champ `seg.speaker` est conservé comme fallback
+pour les enregistrements déjà sauvegardés dans l'historique (qui ne
+contiennent pas `speaker_id`).
 
 ### Fichier modifié
 
 #### `sidepanel.js`
 - `displayTranscription()` : `speaker.textContent = seg.speaker || "Locuteur"`
-  remplacé par une expression lisant `seg.speaker_id` avec conversion en
-  « Locuteur N » et fallback `seg.speaker`.
+  remplacé par une expression lisant `seg.speaker_id` avec affichage direct du
+  numéro et fallback `seg.speaker`.
 
 ### Comportement
 
