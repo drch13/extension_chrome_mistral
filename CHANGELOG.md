@@ -2,6 +2,43 @@
 
 ---
 
+## 2026-09-14 — Correctif de la diarisation (différenciation des locuteurs)
+
+### Contexte et objectif
+
+En mode Transcription avec diarisation activée, l'affichage montrait
+« Locuteur » pour tous les segments, sans jamais différencier les deux
+interlocuteurs. Les segments étaient bien présents (le texte était correct),
+mais l'étiquette du locuteur restait générique.
+
+### Correctif apporté
+
+Dans `displayTranscription()` (`sidepanel.js`), l'étiquette du locuteur lisait
+`seg.speaker`, champ inexistant dans la réponse de l'API Mistral
+`/v1/audio/transcriptions`. Celle-ci renvoie en réalité `speaker_id`
+(valeurs `speaker_0`, `speaker_1`, …). L'expression `undefined || "Locuteur"`
+retombait donc toujours sur le fallback.
+
+La ligne est corrigée pour lire `seg.speaker_id`, convertir l'indice en label
+lisible (`speaker_0` → « Locuteur 1 », `speaker_1` → « Locuteur 2 »), et
+conserver `seg.speaker` comme fallback pour les enregistrements déjà
+sauvegardés dans l'historique (qui ne contiennent pas `speaker_id`).
+
+### Fichier modifié
+
+#### `sidepanel.js`
+- `displayTranscription()` : `speaker.textContent = seg.speaker || "Locuteur"`
+  remplacé par une expression lisant `seg.speaker_id` avec conversion en
+  « Locuteur N » et fallback `seg.speaker`.
+
+### Comportement
+
+Les nouveaux enregistrements diarisés affichent correctement les numéros de
+locuteurs distincts. L'historique existant (segments sans `speaker_id`)
+continue d'afficher « Locuteur » via le fallback, sans régression.
+
+---
+
 ## 2026-09-12 — Ajout du mode Transcription (speech-to-text avec diarisation)
 
 ### Contexte et objectif

@@ -672,7 +672,9 @@ function displayTranscription(result, duration, diarizedOverride) {
       segDiv.className = "stt-segment";
       const speaker = document.createElement("div");
       speaker.className = "stt-speaker";
-      speaker.textContent = seg.speaker || "Locuteur";
+      speaker.textContent = seg.speaker_id != null
+        ? `Locuteur ${parseInt(String(seg.speaker_id).replace(/\D/g, ""), 10) + 1}`
+        : (seg.speaker || "Locuteur");
       const text = document.createElement("div");
       text.className = "stt-segment-text";
       text.textContent = (seg.text || "").trim();
