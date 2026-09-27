@@ -255,6 +255,25 @@ body {
   line-height: 1.45;
   white-space: pre;
 }
+.answer-content .md-table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0 0 8px;
+}
+.answer-content .md-table th,
+.answer-content .md-table td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.answer-content .md-table th {
+  background: rgba(127, 127, 127, 0.16);
+  font-weight: 700;
+}
 
 /* Chat */
 .chat {

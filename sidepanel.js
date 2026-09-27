@@ -113,7 +113,8 @@ function mdInline(raw, inlineCodes) {
   let s = escapeHtml(raw);
   s = s.replace(/`([^`\n]+)`/g, (_, c) => {
     const idx = inlineCodes.length;
-    inlineCodes.push('<code class="md-inline-code">' + c + "</code>");
+    // GFM table cells: an escaped pipe keeps its cell intact and displays bare.
+    inlineCodes.push('<code class="md-inline-code">' + c.replace(/\\\|/g, "&#124;") + "</code>");
     return "\u0000I" + idx + "\u0000";
   });
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -122,6 +123,53 @@ function mdInline(raw, inlineCodes) {
   s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
   s = s.replace(/(^|[^\w])_([^_\n]+)_([^\w]|$)/g, "$1<em>$2</em>$3");
   return s;
+}
+
+// ---- Markdown tables ----
+// Split a "|"-delimited row into trimmed cells. Leading/trailing pipes are
+// optional; escaped pipes (\|) stay inside their cell.
+function splitTableRow(line) {
+  let s = line.trim().replace(/\\\|/g, "&#124;");
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+function isSeparatorRow(line) {
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+// Parse a GFM table: rows[0] is the header, rows[1] the separator row
+// (e.g. |---|:--:|---:|), the rest are body rows. Cell content goes through
+// mdInline first (which extracts inline code, so pipes inside `...` do not
+// split cells) and is escaped exactly like the rest of the output. Rows with
+// fewer cells than the header are padded; extra cells are ignored, per GFM.
+function parseMdTable(rows, inlineCodes) {
+  const aligns = splitTableRow(rows[1]).map((c) => {
+    if (/^:-+:$/.test(c)) return "center";
+    if (/^-+:$/.test(c)) return "right";
+    if (/^:-+$/.test(c)) return "left";
+    return null;
+  });
+  const headCells = splitTableRow(mdInline(rows[0], inlineCodes));
+  const nCols = headCells.length;
+  const alignAttr = (idx) =>
+    aligns[idx] ? ' style="text-align: ' + aligns[idx] + ';"' : "";
+  let out = '<table class="md-table"><thead><tr>';
+  headCells.forEach((c, idx) => { out += "<th" + alignAttr(idx) + ">" + c + "</th>"; });
+  out += "</tr></thead><tbody>";
+  for (let r = 2; r < rows.length; r++) {
+    const cells = splitTableRow(mdInline(rows[r], inlineCodes));
+    while (cells.length < nCols) cells.push("");
+    if (!cells.slice(0, nCols).some((c) => c !== "")) continue;
+    out += "<tr>";
+    for (let idx = 0; idx < nCols; idx++) {
+      out += "<td" + alignAttr(idx) + ">" + cells[idx] + "</td>";
+    }
+    out += "</tr>";
+  }
+  return out + "</tbody></table>";
 }
 
 function renderMarkdown(text) {
@@ -197,13 +245,29 @@ function renderMarkdown(text) {
       i++; continue;
     }
 
+    // GFM table: "|"-delimited header row followed by a separator row of
+    // dashes (with optional ":" alignment markers).
+    if (/^\s*\|/.test(line) && i + 1 < lines.length && isSeparatorRow(lines[i + 1])) {
+      closeList(); closeQuote();
+      const rows = [line, lines[i + 1]];
+      i += 2;
+      while (i < lines.length && /^\s*\|/.test(lines[i])) { rows.push(lines[i]); i++; }
+      html.push(parseMdTable(rows, inlineCodes));
+      continue;
+    }
+
     if (line.trim() === "") { closeList(); closeQuote(); i++; continue; }
 
+    // Paragraph: stop at any block start, but only at a *valid* table start
+    // (a lone "|"-line, e.g. mid-stream, is plain text and must be consumed).
+    const isTableStart = (j) =>
+      /^\s*\|/.test(lines[j]) && j + 1 < lines.length && isSeparatorRow(lines[j + 1]);
     closeList(); closeQuote();
     const para = [];
     while (i < lines.length && lines[i].trim() !== "" &&
       !/^(#{1,6})\s/.test(lines[i]) && !/^[-*]\s/.test(lines[i]) &&
       !/^\d+\.\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) &&
+      !isTableStart(i) &&
       !/^\u0000B\d+\u0000$/.test(lines[i].trim()) && !/^(-{3,}|\*{3,})\s*$/.test(lines[i])) {
       para.push(lines[i]);
       i++;

@@ -2,6 +2,115 @@
 
 ---
 
+## 2026-09-27 — Rendu des tableaux Markdown dans les réponses de l'assistant
+
+### Contexte et objectif
+
+Le moteur de rendu Markdown sans dépendance (`renderMarkdown` dans
+`sidepanel.js`, ajouté le 2026-09-12) couvrait titres, listes, citations, code,
+liens et filets, mais pas les tableaux. Or les modèles répondent fréquemment
+avec des tableaux au format GFM (lignes `| Cellule | Cellule |` suivies d'une
+ligne séparatrice `|---|---|`) : ces réponses s'affichaient en texte brut,
+les pipes et les lignes de séparation restant visibles sans aucune mise en
+forme, ce qui rendait les tableaux difficilement lisibles dans le panneau.
+
+L'objectif est de rendre ces tableaux en `<table>` HTML stylé, sans introduire
+de dépendance externe (l'alternative étudiée, `marked` + DOMPurify, a été
+écartée au profit d'un parseur maison d'environ 60 lignes) et sans ouvrir de
+faille XSS : le contenu des cellules doit rester échappé exactement comme le
+reste de la sortie du modèle.
+
+### Fonctionnalités apportées
+
+1. **Détection des tableaux GFM**
+   Dans la boucle de blocs de `renderMarkdown`, une ligne commençant par `|`
+   suivie d'une ligne séparatrice valide (cellules composées uniquement de
+   tirets, avec marqueurs d'alignement optionnels `:`) déclenche le rendu en
+   tableau. Les lignes suivantes commençant par `|` sont consommées comme
+   lignes du corps du tableau. Une ligne `|` orpheline (sans séparateur
+   suivant, typiquement en plein streaming) reste du texte de paragraphe :
+   aucun bloc n'est ouvert pour rien.
+
+2. **Parseur maison `parseMdTable`**
+   Trois fonctions sont ajoutées entre `mdInline` et `renderMarkdown` :
+   `splitTableRow` (découpe une ligne en cellules, pipes de bord optionnels,
+   pipe échappé `\|` conservé dans sa cellule), `isSeparatorRow` (valide la
+   ligne séparatrice) et `parseMdTable` (construit le HTML). Conformément à
+   la spécification GFM : les marqueurs `:-` / `:-:` / `-:` produisent un
+   alignement gauche / centré / droite (via attribut `style` sur `th` et
+   `td`), les lignes ayant moins de cellules que l'en-tête sont complétées
+   par des cellules vides, les cellules excédentaires sont ignorées, et les
+   lignes entièrement vides sont sautées.
+
+3. **Sécurité inchangée**
+   Le contenu de chaque cellule passe par `mdInline`, comme tout le reste :
+   le HTML y est échappé avant toute transformation, un `<img onerror=…>`
+   produit par le modèle reste donc inoffensif. Le gras, l'italique, les
+   liens et le code inline fonctionnent dans les cellules. Un pipe contenu
+   dans un code inline (`` `a\|b` ``) ne scinde pas la cellule : le code est
+   extrait en placeholder avant le découpage, et le `\|` est restitué en
+   pipe nu (`&#124;`), conformément à l'extension tableaux de GFM.
+
+4. **Compatibilité streaming**
+   Le rendu étant réappliqué à chaque morceau reçu, le tableau apparaît
+   progressivement : en-tête seul = texte brut (comportement précédent),
+   en-tête + séparateur = table vide qui se remplit au fil des chunks. Un
+   correctif de boucle infinie a été nécessaire : la première implémentation
+   excluait toute ligne `|` de la boucle d'accumulation de paragraphe, si
+   bien qu'une ligne `|` orpheline n'était consommée par aucune branche et
+   figeait le rendu. Le paragraphe ne s'arrête désormais que devant un début
+   de tableau *valide* (séparateur présent).
+
+5. **Mise en forme CSS**
+   Les styles `.md-table` (bordures `var(--border)`, fond d'en-tête
+   identique aux blocs de code, marges cohérentes avec `.md-p`) sont
+   ajoutés dans le bloc Markdown de `sidepanel.css`. Le tableau est en
+   `display: block` avec `overflow-x: auto` et `width: max-content`
+   plafonné à 100 % : les tableaux larges défilent horizontalement dans le
+   panneau étroit au lieu de le déformer.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- Nouvelles fonctions `splitTableRow`, `isSeparatorRow`, `parseMdTable`
+  (entre `mdInline` et `renderMarkdown`).
+- `renderMarkdown()` : détection d'un tableau GFM dans la boucle de blocs
+  (après le filet horizontal, avant la ligne vide), fermeture de la liste ou
+  de la citation en cours, consommation des lignes de corps.
+- `renderMarkdown()` : la boucle d'accumulation de paragraphe s'arrête
+  désormais devant un début de tableau valide (`isTableStart`) et non plus
+  devant toute ligne `|`.
+- `mdInline()` : le contenu d'un code inline subit `replace(/\\\|/g,
+  "&#124;")` pour que le pipe échappé s'affiche nu (comportement GFM des
+  tableaux).
+
+#### `sidepanel.css`
+- Ajout des styles `.md-table` (table, `th`, `td` : bordures, padding,
+  alignement gauche par défaut, fond d'en-tête `rgba(127,127,127,0.16)`,
+  débordement horizontal).
+
+### Comportement
+
+Les tableaux des réponses de l'assistant sont rendus en HTML mis en forme,
+aussi bien en streaming qu'à la relecture d'une conversation depuis
+l'historique (les deux chemins passent par `renderMarkdown`). Les tableaux
+contenus dans des blocs de code (triple backticks) restent du texte brut,
+comme avant. Aucune option utilisateur : le rendu est automatique.
+
+### Limites connues
+
+- Pas de fusion de cellules (`colspan` / `rowspan`), non couvert par GFM.
+- Une ligne `|` sans séparateur reste du texte brut — c'est voulu (le
+  séparateur est ce qui distingue un tableau d'un texte quelconque).
+- Le rendu a été validé visuellement dans Chrome par l'utilisateur sur une
+  réponse réelle du modèle ; le parseur a par ailleurs été testé isolément
+  sous Node sur 18 assertions (tableau simple, alignements, pipes dans code
+  inline, échappement HTML d'une injection `<img onerror>`, lignes courtes et
+  longues, fallback sans séparateur, états partiels de streaming, contexte
+  liste/titre, pipe échappé, ligne vide).
+
+---
+
 ## 2026-09-14 — Correctif de la diarisation (différenciation des locuteurs)
 
 ### Contexte et objectif
