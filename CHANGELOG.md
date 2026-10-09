@@ -2,6 +2,126 @@
 
 ---
 
+## 2026-10-09 — Augmentation du contexte envoyé au modèle à 64 000 caractères (HTML et PDF)
+
+### Contexte et objectif
+
+Le texte extrait de l'onglet actif était plafonné à 16 000 caractères, aussi
+bien pour les pages HTML (`MAX` dans `extractPageContent`) que pour les PDF
+(`PDF_MAX` dans `parsePdfText`). Sur une page ou un article long, le texte
+transmis au modèle s'arrêtait donc au milieu d'une phrase — le marqueur
+`[…tronqué]` restait visible dans la trace de réflexion — et la fin du
+document (conclusion, références) était perdue pour le modèle.
+
+La limite est portée à 64 000 caractères après analyse du compromis
+coût/fenêtre : 64 000 caractères de français représentent environ 16 000 à
+20 000 tokens, soit ~15 % de la fenêtre de contexte (~128k tokens) des
+modèles proposés (`mistral-small-latest`, `mistral-medium-latest`,
+`zai-glm-5-2`). Un palier de 128 000 caractères a été envisagé puis écarté :
+coût d'entrée multiplié par ~4 à chaque question (le contexte est renvoyé
+dans le message système à chaque tour), latence de préfill nettement accrue,
+dilution de l'attention du modèle sur du contenu non pertinent
+(navigation, pieds de page capturés par le repli sur `document.body`), et
+marge réduite pour l'historique de conversation, lui-même non borné.
+
+### Modifications apportées
+
+- `extractPageContent()` : `MAX` passe de 16 000 à 64 000 caractères. Le
+  marqueur `[…tronqué]` n'est inséré qu'au-delà de cette limite.
+- `parsePdfText()` : `PDF_MAX` passe de 16 000 à 64 000 caractères. La
+  boucle d'extraction s'arrête toujours dès que la limite est atteinte, le
+  nombre de pages réellement parsées reste donc borné par la taille du
+  texte extrait.
+- `SELECTION_MAX` (sélection de texte ciblée par l'utilisateur) reste
+  inchangé à 8 000 caractères.
+- Commentaire d'en-tête de `extractPageContent` mis à jour en conséquence.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- `extractPageContent()` : `const MAX = 16000` → `const MAX = 64000`.
+- `parsePdfText()` : `const PDF_MAX = 16000` → `const PDF_MAX = 64000`.
+
+### Comportement
+
+Le chip de contexte affiché sous la question peut désormais indiquer
+jusqu'à ~64 (milliers de caractères capturés). Les pages et PDF courts
+sont inchangés ; seuls les documents dépassant 64 000 caractères sont
+toujours tronqués, avec le même marqueur explicite.
+
+### Limites connues
+
+- **Coût par question multiplié par ~4** : le message système embarquant le
+  contexte est reconstruit et renvoyé à chaque tour ; une session de 20
+  questions sur la même page consomme ~300 à 400k tokens d'entrée rien que
+  pour le contexte.
+- **Latence** : préfill de ~16-20k tokens avant le premier token, plus
+  sensible avec `reasoning_effort: "high"`.
+- **Historique non borné** : sur de très longues conversations, c'est
+  désormais l'historique (renvoyé intégralement à chaque tour) et non le
+  contexte de page qui devient le principal risque de saturation de la
+  fenêtre. Aucune borne de sécurité n'a été ajoutée sur l'historique.
+- La syntaxe a été validée par `node --check` ; un test manuel dans Chrome
+  (page longue, PDF long, vérification du chip) est recommandé.
+
+---
+
+## 2026-10-09 — Correctif de la numérotation des listes ordonnées dans le rendu Markdown
+
+### Contexte et objectif
+
+Les réponses du modèle contiennent fréquemment des listes « lâches » : des
+points numérotés séparés par des lignes vides, chaque point étant souvent
+un titre suivi d'un paragraphe. Le rendu affichait alors « 1. Premier
+titre … 1. Deuxième titre » au lieu de « 1. Premier titre … 2. Deuxième
+titre ». Deux causes se combinent dans `renderMarkdown` :
+
+1. Le numéro littéral écrit par le modèle (capturé par
+   `/^(\d+)\.\s+/` dans `ol[1]`) était ignoré : le rendu reposait
+   entièrement sur l'auto-numérotation du navigateur, qui compte les
+   `<li>` d'un `<ol>` à partir de 1.
+2. Toute ligne vide déclenche `closeList()` : la liste est refermée, et
+   le `N.` suivant ouvre donc un nouveau `<ol>` dont la numérotation
+   repart à 1.
+
+### Correctif apporté
+
+À l'ouverture d'une nouvelle liste ordonnée, si le numéro littéral du
+premier item est supérieur à 1, il est désormais repris via l'attribut
+HTML `start` du `<ol>` (ex. `<ol class="md-ol" start="2">`), conformément
+au comportement GFM des listes lâches. Les listes commençant à 1 sont
+inchangées (aucun attribut ajouté).
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- `renderMarkdown()`, bloc de détection des listes ordonnées : ouverture
+  conditionnelle `<ol class="md-ol" start="N">` au lieu de
+  `<ol class="md-ol">` systématique ; le numéro capturé `ol[1]` n'est plus
+  jeté.
+
+### Comportement
+
+Une liste « 2. » qui suit une ligne vide ou un paragraphe s'affiche
+désormais « 2. ». Une liste compacte commençant à 10 affiche bien 10,
+11, etc. Les listes consécutives sans ligne vide gardent la numérotation
+continue du navigateur, comme avant.
+
+### Limites connues
+
+- Une liste interrompue par une ligne vide reste visuellement un bloc
+  `<ol>` distinct (pas de fusion en une liste unique, ni de gestion des
+  items multi-paragraphes indentés). Seule la numérotation est corrigée.
+- Les trous de numérotation au sein d'une même liste compacte (ex. « 1. »
+  puis « 3. » sans ligne vide) ne sont pas gérés — l'attribut `value`
+  sur `<li>` n'est pas utilisé : le navigateur continue séquentiellement.
+- Validation : test isolé sous Node sur `renderMarkdown` extraite du
+  fichier (liste lâche 1./2./3. avec paragraphes intercalés, liste compacte
+  10./11., liste commençant à 1 inchangée), et syntaxe validée par
+  `node --check`. Test visuel dans Chrome recommandé.
+
+---
+
 ## 2026-09-27 — Rendu des tableaux Markdown dans les réponses de l'assistant
 
 ### Contexte et objectif

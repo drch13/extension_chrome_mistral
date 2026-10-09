@@ -234,7 +234,15 @@ function renderMarkdown(text) {
 
     const ol = line.match(/^(\d+)\.\s+(.*)$/);
     if (ol) {
-      if (!inList || listType !== "ol") { closeList(); html.push('<ol class="md-ol">'); inList = true; listType = "ol"; }
+      // A blank line closes the list, so a "2." after a paragraph would
+      // otherwise restart browser numbering at 1. Honor the model's literal
+      // number via the start attribute (matches GFM loose-list behavior).
+      if (!inList || listType !== "ol") {
+        closeList();
+        const startAttr = +ol[1] > 1 ? ` start="${+ol[1]}"` : "";
+        html.push(`<ol class="md-ol"${startAttr}>`);
+        inList = true; listType = "ol";
+      }
       html.push("<li>" + mdInline(ol[2], inlineCodes) + "</li>");
       i++; continue;
     }
@@ -1110,7 +1118,7 @@ keyCancel.addEventListener("click", closeKeyDialog);
 settingsBtn.addEventListener("click", () => openKeyDialog(true));
 
 // ---- Page content extraction ----
-// Runs in the active tab's page via chrome.scripting. Returns up to ~16k chars
+// Runs in the active tab's page via chrome.scripting. Returns up to ~64k chars
 // of the main readable text so the model can answer "about this page".
 function extractPageContent() {
   // Executed in the page context (no access to chrome.* APIs here).
@@ -1138,7 +1146,7 @@ function extractPageContent() {
     cleanText(document.querySelector('[role="main"]')) ||
     cleanText(document.body);
 
-  const MAX = 16000;
+  const MAX = 64000;
   if (text.length > MAX) text = text.slice(0, MAX) + "\n[…tronqué]";
   return { title, url, text };
 }
@@ -1155,7 +1163,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // exposed by Chrome's built-in viewer is essentially empty, so extractPageContent
 // returns nothing. We instead fetch the bytes and parse the text layer with
 // pdf.js. The HTML path below stays unchanged for normal pages.
-const PDF_MAX = 16000;
+const PDF_MAX = 64000;
 
 // Parse a PDF ArrayBuffer into up to PDF_MAX chars of text, using pdf.js loaded
 // in the side panel. Shared by both fetch paths below.
