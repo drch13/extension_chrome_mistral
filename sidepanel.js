@@ -8,14 +8,15 @@ const STT_MODEL = "voxtral-mini-latest";
 const MODEL_LABELS = {
   "mistral-small-latest": "Mistral Small 4",
   "mistral-medium-latest": "Mistral Medium 3.5",
-  "zai-glm-5-2": "GLM 5.2",
+  "mistral-large-4-0": "Mistral Large 4",
+  "zai-glm-5-3": "GLM 5.3",
 };
 
 // Conversation history (kept in memory, scoped to the side-panel session).
 let history = []; // messages of the currently open conversation: [{role, content, reasoning?}]
 let apiKey = "";
 let currentModel = "mistral-small-latest";
-let reasoningEnabled = false; // sends reasoning_effort="high" when true (Mistral models only)
+let reasoningEnabled = false; // selects the reasoning_effort value (see reasoningEffortFor)
 let inFlight = false;
 let lastContext = null; // { url, title, text }
 let currentSelection = ""; // live text selection from the active tab
@@ -382,10 +383,12 @@ async function loadSettings() {
   ]);
   apiKey = data.mistralApiKey || "";
   currentModel = data.mistralModel || "mistral-small-latest";
+  // A stored model id may no longer be offered (e.g. zai-glm-5-2 retired)
+  // after an update; fall back to the default so requests never reference
+  // a model the API would reject.
+  if (!MODEL_LABELS[currentModel]) currentModel = "mistral-small-latest";
   reasoningEnabled = !!data.mistralReasoning;
-  if (MODEL_LABELS[currentModel]) {
-    modelSelect.value = currentModel;
-  }
+  modelSelect.value = currentModel;
   reasoningToggle.checked = reasoningEnabled;
   syncReasoningToggleAvailability();
 
@@ -402,12 +405,28 @@ async function saveApiKey(key) {
   await chrome.storage.local.set({ mistralApiKey: apiKey });
 }
 
-// reasoning_effort is documented for mistral-small-latest and mistral-medium
-// (3.5). The GLM model exposed here is a third-party one without documented
-// reasoning support, so we disable the toggle for it rather than risk an API
-// error.
+// reasoning_effort is documented for all four exposed models:
+// mistral-small-latest, mistral-medium-latest and mistral-large-4-0 accept
+// "high"/"none"; zai-glm-5-3 accepts "low"/"high"/"max" (no "none") and
+// always returns content as a list of thinking/text chunks, which the
+// streaming parser already handles. The effort value sent for each state
+// is decided by reasoningEffortFor below.
 function modelSupportsReasoning(model) {
-  return model === "mistral-small-latest" || model === "mistral-medium-latest";
+  return model === "mistral-small-latest" ||
+    model === "mistral-medium-latest" ||
+    model === "mistral-large-4-0" ||
+    model === "zai-glm-5-3";
+}
+
+// Effort sent to the API for a given model and toggle state. Reasoning-
+// native models (mistral-large-4-0, zai-glm-5-3) emit a thinking chunk
+// even when reasoning_effort is omitted, so the toggle-off case must be
+// explicit: "none" on Mistral models omits the thinking chunk per the
+// docs; zai-glm-5-3 has no "none", "low" is the minimum it accepts.
+function reasoningEffortFor(model, enabled) {
+  if (!modelSupportsReasoning(model)) return null;
+  if (enabled) return "high";
+  return model === "zai-glm-5-3" ? "low" : "none";
 }
 
 function syncReasoningToggleAvailability() {
@@ -1407,7 +1426,8 @@ function buildMessages() {
 }
 
 async function streamMistral(question) {
-  const useReasoning = reasoningEnabled && modelSupportsReasoning(currentModel);
+  const effort = reasoningEffortFor(currentModel, reasoningEnabled);
+  const useReasoning = effort === "high";
   const body = {
     model: currentModel,
     messages: buildMessages(),
@@ -1417,7 +1437,9 @@ async function streamMistral(question) {
     // completion budget, so give some headroom when enabled.
     max_tokens: useReasoning ? 8000 : 3000,
   };
-  if (useReasoning) body.reasoning_effort = "high";
+  // Always send an explicit effort: reasoning-native models (mistral-large-4-0,
+  // zai-glm-5-3) produce a thinking chunk even when the parameter is omitted.
+  body.reasoning_effort = effort;
 
   const res = await fetch(API_URL, {
     method: "POST",
@@ -1499,7 +1521,7 @@ async function streamMistral(question) {
         const json = JSON.parse(payload);
         const delta = json.choices?.[0]?.delta;
 
-        // New-style reasoning (mistral-small/medium with reasoning_effort):
+        // Typed reasoning chunks (reasoning_effort models, incl. GLM 5.3):
         // delta.content is either a string (answer phase) or a list of typed
         // chunks (ThinkChunk / TextChunk).
         const content = delta?.content;

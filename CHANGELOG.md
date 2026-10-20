@@ -2,6 +2,139 @@
 
 ---
 
+## 2026-10-20 — Correctif : réflexion non coupée sur Mistral Large 4 et GLM 5.3
+
+### Contexte et objectif
+
+Après l'ajout de Mistral Large 4 et GLM 5.3, des tests dans Chrome ont montré
+que ces deux modèles produisent une trace de réflexion même quand le toggle
+« Réflexion » est décoché. Les requêtes ne posaient pourtant aucun souci sur
+Mistral Small 4 et Medium 3.5.
+
+Cause : `streamMistral` n'envoyait `reasoning_effort` que lorsque le toggle
+était activé (`"high"`), et omettait totalement le paramètre sinon. Or ces
+deux modèles sont à raisonnement natif : omettre le paramètre conserve le
+comportement par défaut de l'API, qui inclut un chunk de réflexion. Pour les
+couper, il faut demander explicitement `reasoning_effort: "none"` (documenté
+pour les modèles Mistral). GLM 5.3 n'accepte pas `none` : `low`/`high`/`max`
+sont ses seules valeurs, `low` étant le minimum.
+
+### Correctif apporté
+
+Un `reasoning_effort` explicite est désormais envoyé à chaque requête,
+calculé par une nouvelle fonction `reasoningEffortFor(model, enabled)` :
+
+- toggle activé → `"high"` (tous les modèles, inchangé) ;
+- toggle désactivé, modèle Mistral (Small, Medium, Large 4) → `"none"`,
+  valeur documentée qui supprime le chunk de réflexion ;
+- toggle désactivé, GLM 5.3 → `"low"`, l'effort minimal supporté.
+
+`max_tokens` suit toujours l'état du toggle (8000 avec réflexion, 3000
+sinon). Le comportement de Mistral Small 4 et Medium 3.5 avec le toggle
+éteint passe techniquement de « paramètre omis » à `"none"` explicite :
+valeur documentée pour ces modèles, sans changement observable.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- Nouvelle fonction `reasoningEffortFor()` (après `modelSupportsReasoning`) :
+  choisit l'effort selon le modèle et le toggle.
+- `streamMistral()` : `body.reasoning_effort` est toujours positionné
+  (plus jamais omis) via `reasoningEffortFor`.
+- Commentaires d'État et d'en-tête mis à jour.
+
+### Limites connues
+
+- La réflexion de GLM 5.3 ne peut pas être totalement désactivée (pas de
+  `"none"` côté API) : avec le toggle éteint, l'effort `"low"` minimise la
+  trace mais un court chunk `thinking` peut subsister ; il s'affiche dans le
+  bloc « Réflexion » repliable, comme prévu.
+- Syntaxe validée par `node --check` ; à re-tester dans Chrome pour chaque
+  modèle avec le toggle allumé puis éteint.
+
+---
+## 2026-10-20 — GLM 5.2 remplacé par GLM 5.3, ajout de Mistral Large 4
+
+### Contexte et objectif
+
+Le sélecteur de modèle du mode Chat offrait trois modèles : Mistral Small 4,
+Mistral Medium 3.5 et GLM 5.2 (`zai-glm-5-2`). La documentation de l'API
+Mistral (docs.mistral.ai) fait désormais état de deux changements :
+
+1. **GLM 5.3** remplace GLM 5.2. Identifiant API : `zai-glm-5-3` (également
+   servi sous `zai-glm-5` et `zai-glm-latest`). Modèle tiers open weight de
+   Z.ai hébergé par Mistral, fenêtre de contexte de 1M de tokens, limite de
+   sortie de 128k tokens. Contrairement à GLM 5.2, il **supporte
+   `reasoning_effort`**, avec les valeurs `low`, `high` et `max` (pas de
+   `none`), et renvoie toujours `message.content` sous forme de liste de
+   chunks typés (`thinking` + `text`), y compris sans `reasoning_effort`.
+2. **Mistral Large 4** est ajouté comme quatrième modèle. Identifiant API :
+   `mistral-large-4-0` (aussi `mistral-large-4`). MoE open weight
+   (1,05T de paramètres dont 52B actifs), multimodal, sortie
+   « reasoning, text », supporte `reasoning_effort` (`high` / `none`).
+
+### Modifications apportées
+
+- `MODEL_LABELS` (`sidepanel.js`) : `zai-glm-5-2` est remplacé par
+  `zai-glm-5-3` (« GLM 5.3 ») et `mistral-large-4-0` (« Mistral Large 4 »)
+  est ajouté.
+- `sidepanel.html` : le `<select id="modelSelect">` propose désormais quatre
+  options dans l'ordre Small, Medium, Large, GLM.
+- `modelSupportsReasoning()` : le toggle « Réflexion » n'est plus désactivé
+  pour GLM. GLM 5.3 et Mistral Large 4 documentent tous deux
+  `reasoning_effort` ; l'extension n'envoie que `"high"`, valeur supportée
+  par les quatre modèles. Le mécanisme de désactivation
+  (`syncReasoningToggleAvailability`) est conservé mais ne s'active plus
+  pour aucun modèle proposé.
+- `loadSettings()` : repli sur `mistral-small-latest` si l'identifiant
+  persisté dans `chrome.storage.local` n'est plus proposé (typiquement
+  `zai-glm-5-2` stocké avant la mise à jour), afin de ne jamais envoyer à
+  l'API un identifiant retiré. Auparavant, un identifiant inconnu laissait
+  `currentModel` inchangé alors que le sélecteur revenait visuellement au
+  premier modèle.
+- Le parseur de streaming n'est pas modifié : il gère déjà
+  `delta.content` en chaîne (phase texte) et en liste de chunks typés
+  (`thinking` / `text`), format que GLM 5.3 renvoie systématiquement,
+  réflexion activée ou non.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- `MODEL_LABELS` : retrait de `zai-glm-5-2`, ajout de `zai-glm-5-3` et
+  `mistral-large-4-0`.
+- `loadSettings()` : repli sur le modèle par défaut pour un identifiant
+  persisté inconnu.
+- `modelSupportsReasoning()` : retourne `true` pour les quatre modèles ;
+  commentaires mis à jour (valeurs `reasoning_effort` par modèle).
+- Commentaires d'État et de streaming mis à jour (le format de chunks
+  n'est plus spécifique à mistral-small/medium).
+
+#### `sidepanel.html`
+- `#modelSelect` : option `zai-glm-5-2` remplacée par `zai-glm-5-3`,
+  option `mistral-large-4-0` ajoutée.
+
+### Comportement
+
+Le sélecteur propose quatre modèles. Le toggle « Réflexion » est désormais
+utilisable avec tous, GLM 5.3 compris (l'effort envoyé est `"high"`,
+valeur supportée ; GLM n'acceptant pas `"none"`, l'extension ne l'envoie
+jamais : le paramètre est simplement omis quand le toggle est éteint). Les
+conversations sauvegardées avec GLM 5.2 s'ouvrent sans erreur : le libellé
+retombe sur l'identifiant brut et le modèle du sélecteur n'est pas changé ;
+seule la préférence persistée obsolète est ignorée au démarrage.
+
+### Limites connues
+
+- `mistral-large-4-0` est en Public Preview côté Mistral ; son identifiant
+  ou ses limites peuvent évoluer.
+- Sans réflexion, GLM 5.3 peut tout de même produire des chunks
+  `thinking` (pas de mode `"none"`) : ils s'affichent dans le bloc
+  « Réflexion » repliable, ce qui est le comportement voulu.
+- Syntaxe validée par `node --check` ; test manuel dans Chrome
+  recommandé (sélection de chaque modèle, envoi avec et sans réflexion,
+  relecture d'une conversation sauvegardée avec GLM 5.2).
+
+---
 ## 2026-10-09 — Augmentation du contexte envoyé au modèle à 64 000 caractères (HTML et PDF)
 
 ### Contexte et objectif
