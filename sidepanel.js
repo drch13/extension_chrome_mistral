@@ -740,7 +740,31 @@ function displayTranscription(result, duration, diarizedOverride) {
   copyBtn.className = "stt-copy-btn";
   copyBtn.textContent = "Copier";
   copyBtn.addEventListener("click", () => {
-    navigator.clipboard.writeText(result.text || "").then(() => {
+    let copyText = result.text || "";
+    if (showDiarized && Array.isArray(result.segments) && result.segments.length > 0) {
+      const lines = [];
+      let currentKey = null;
+      let currentLabel = "";
+      let currentText = "";
+      for (const seg of result.segments) {
+        const label = seg.speaker_id != null
+          ? `Locuteur ${parseInt(String(seg.speaker_id).replace(/\D/g, ""), 10)}`
+          : (seg.speaker || "Locuteur");
+        const key = seg.speaker_id != null ? String(seg.speaker_id) : label;
+        const text = (seg.text || "").trim();
+        if (key !== currentKey) {
+          if (currentKey !== null) lines.push(`[${currentLabel}] : ${currentText}`);
+          currentKey = key;
+          currentLabel = label;
+          currentText = text;
+        } else {
+          currentText += (currentText ? " " : "") + text;
+        }
+      }
+      if (currentKey !== null) lines.push(`[${currentLabel}] : ${currentText}`);
+      copyText = lines.join("\n\n");
+    }
+    navigator.clipboard.writeText(copyText).then(() => {
       copyBtn.textContent = "Copié";
       copyBtn.classList.add("copied");
       setTimeout(() => {
@@ -758,20 +782,30 @@ function displayTranscription(result, duration, diarizedOverride) {
   if (showDiarized && Array.isArray(result.segments) && result.segments.length > 0) {
     const segContainer = document.createElement("div");
     segContainer.className = "stt-segments";
+    let currentSpeakerKey = null;
+    let currentTextDiv = null;
     for (const seg of result.segments) {
-      const segDiv = document.createElement("div");
-      segDiv.className = "stt-segment";
-      const speaker = document.createElement("div");
-      speaker.className = "stt-speaker";
-      speaker.textContent = seg.speaker_id != null
+      const speakerLabel = seg.speaker_id != null
         ? `Locuteur ${parseInt(String(seg.speaker_id).replace(/\D/g, ""), 10)}`
         : (seg.speaker || "Locuteur");
-      const text = document.createElement("div");
-      text.className = "stt-segment-text";
-      text.textContent = (seg.text || "").trim();
-      segDiv.appendChild(speaker);
-      segDiv.appendChild(text);
-      segContainer.appendChild(segDiv);
+      const speakerKey = seg.speaker_id != null ? String(seg.speaker_id) : speakerLabel;
+      const segText = (seg.text || "").trim();
+      if (speakerKey !== currentSpeakerKey) {
+        currentSpeakerKey = speakerKey;
+        const segDiv = document.createElement("div");
+        segDiv.className = "stt-segment";
+        const speaker = document.createElement("div");
+        speaker.className = "stt-speaker";
+        speaker.textContent = speakerLabel;
+        currentTextDiv = document.createElement("div");
+        currentTextDiv.className = "stt-segment-text";
+        currentTextDiv.textContent = segText;
+        segDiv.appendChild(speaker);
+        segDiv.appendChild(currentTextDiv);
+        segContainer.appendChild(segDiv);
+      } else {
+        currentTextDiv.textContent += (currentTextDiv.textContent ? " " : "") + segText;
+      }
     }
     div.appendChild(segContainer);
   } else {

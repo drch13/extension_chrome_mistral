@@ -2,6 +2,82 @@
 
 ---
 
+## 2026-10-28 — Transcription diarisée : groupement des locuteurs et copie enrichie
+
+### Contexte et objectif
+
+Deux améliorations du module Transcription avec diarisation activée :
+
+1. **Affichage** : quand un même locuteur prononçait plusieurs phrases
+   consécutives, l'affichage répétait le badge « Locuteur N » à chaque
+   segment (un bloc par phrase). La lecture était hachée.
+2. **Copier** : le bouton « Copier » copiait le verbatim brut
+   (`result.text`), sans aucune indication de locuteur — inutilisable
+   pour reprendre la transcription dans un document externe.
+
+### Modifications apportées
+
+1. **Groupement des segments par locuteur** (`displayTranscription`) :
+   les segments consécutifs appartenant au même locuteur (même
+   `speaker_id`) sont désormais fusionnés en un seul bloc. Le badge
+   « Locuteur N » n'apparaît qu'une fois par groupe, et les phrases sont
+   concaténées dans le même paragraphe (séparées par un espace). Quand
+   le locuteur change, un nouveau bloc est créé. La clé de groupement
+   est `speaker_id` quand il est présent, avec repli sur le libellé
+   textuel.
+
+2. **Copie enrichie avec locuteurs** (bouton « Copier ») : quand la
+   diarisation est active et que des segments sont présents, le texte
+   copié est reconstruit à partir des segments groupés, au format
+   `[Locuteur N] : texte`, les groupes étant séparés par une ligne vide
+   (`\n\n`). Sans diarisation (ou sans segments), le comportement est
+   inchangé : copie du texte brut.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- `displayTranscription()` : boucle de rendu des segments remplacée par
+  une logique de groupement par locuteur consécutif (suivi de
+  `currentSpeakerKey` et `currentTextDiv`).
+- `displayTranscription()`, handler du bouton « Copier » : construction
+  du texte copié à partir des segments groupés au format
+  `[Locuteur N] : …` quand la diarisation est active.
+
+### Comportement
+
+L'affichage diarisée est désormais continue par locuteur :
+
+```
+Locuteur 1   Honnêtement, c'est fou.
+Locuteur 2   Oui, je vous le confirme. Est-ce qu'on a déjà dépensé…
+
+Locuteur 1   Écoutez, en tout cas, c'est plus de deux fois plus…
+```
+
+Le texte copié dans le presse-papiers :
+
+```
+[Locuteur 1] : Honnêtement, c'est fou.
+
+[Locuteur 2] : Oui, je vous le confirme. Est-ce qu'on a déjà dépensé…
+
+[Locuteur 1] : Écoutez, en tout cas, c'est plus de deux fois plus…
+```
+
+### Limites connues
+
+- Le groupement est strictement consécutif : si le locuteur 1 reprend la
+  parole après le locuteur 2, un nouveau bloc « Locuteur 1 » est créé
+  (pas de fusion des occurrences non adjacentes).
+- Le copier-coller reflète l'état de la diarisation au moment du clic ;
+  rouvrir une transcription sauvegardée avec la diarisation désactivée
+  copie le texte brut.
+- Syntaxe validée par `node --check` ; test manuel dans Chrome recommandé
+  (enregistrement avec diarisation, vérification de l'affichage groupé
+  et du contenu du presse-papiers).
+
+---
+
 ## 2026-10-20 — Correctif : réflexion non coupée sur Mistral Large 4 et GLM 5.3
 
 ### Contexte et objectif
