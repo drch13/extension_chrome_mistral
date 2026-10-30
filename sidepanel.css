@@ -711,6 +711,10 @@ body {
   font-size: 11px;
   color: var(--muted);
 }
+.stt-result-actions {
+  display: flex;
+  gap: 6px;
+}
 .stt-copy-btn {
   border: 1px solid var(--border);
   background: transparent;

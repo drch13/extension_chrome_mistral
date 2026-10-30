@@ -2,6 +2,84 @@
 
 ---
 
+## 2026-10-30 — Durée explicite dans les métadonnées de transcription
+
+### Contexte et objectif
+
+Les métadonnées d'une transcription (en-tête du résultat affiché et
+ligne de métadonnées du fichier Markdown exporté) affichaient la durée
+au format compact `MM:SS` (ex. « 06:25 »), peu explicite dans un
+document.
+
+### Modifications apportées
+
+- Nouvelle fonction `formatDurationLong()` (`sidepanel.js`) produisant
+  une durée écrite en toutes lettres, avec gestion des heures (limite
+  Voxtral : 3 h) et des accords au singulier/pluriel :
+  « 06 minutes 25 secondes », « 01 heure 00 minutes 00 secondes ».
+- Utilisée dans les deux emplacements de métadonnées : en-tête du
+  résultat (`displayTranscription`) et métadonnées du Markdown exporté
+  (`buildTranscriptionMarkdown`).
+- Le chronomètre d'enregistrement en direct et la liste de l'historique
+  conservent le format compact `MM:SS` (`formatDuration`), plus lisible
+  dans ces contextes.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- `formatDurationLong()` ajoutée à côté de `formatDuration()` ;
+  appelée dans `displayTranscription()` et `buildTranscriptionMarkdown()`.
+
+---
+
+## 2026-10-30 — Bouton « Exporter en Markdown » pour la transcription
+
+### Contexte et objectif
+
+Le module Transcription ne proposait qu'un bouton « Copier » : la
+transcription était copiée dans le presse-papiers, mais aucun fichier
+n'était produit. Il était donc fastidieux de reprendre une transcription
+dans un document externe (prise de notes, rapport, compte rendu).
+
+### Modifications apportées
+
+1. **Nouveau bouton « Exporter en Markdown »** (`displayTranscription`,
+   `sidepanel.js`) : placé à côté du bouton « Copier » dans l'en-tête du
+   résultat de transcription (conteneur `.stt-result-actions`). Au clic,
+   la transcription affichée est convertie en document Markdown puis
+   téléchargée via un lien `<a download>` pointant sur un `Blob`
+   (`text/markdown`), avec un nom de fichier horodaté
+   (`transcription-AAAAMMJJ-HHMMSS.md`). Le bouton affiche « Exporté »
+   pendant 2 s, comme « Copié » pour le bouton Copier.
+
+2. **Mise en forme Markdown** (`buildTranscriptionMarkdown`) : le document
+   contient un titre `# Transcription`, une ligne de métadonnées en
+   italique (durée, langue, diarisation), puis, quand la diarisation est
+   active et que des segments existent, un paragraphe par groupe de
+   locuteurs au format `**Locuteur N** : texte`. Sans diarisation, le
+   verbatim brut est repris tel quel.
+
+3. **Factorisation** : la logique de groupement des segments consécutifs
+   par locuteur est extraite dans `groupSegmentsBySpeaker()`, utilisée à
+   la fois par le bouton « Copier » (format `[Locuteur N] : texte`) et par
+   l'export Markdown — le comportement de « Copier » est inchangé.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- Nouvelles fonctions `groupSegmentsBySpeaker()`,
+  `buildTranscriptionMarkdown()` et `downloadMarkdownFile()`.
+- `displayTranscription()` : ajout du bouton « Exporter en Markdown » et
+  du conteneur `.stt-result-actions` ; le handler de « Copier » s'appuie
+  désormais sur `groupSegmentsBySpeaker()`.
+
+#### `sidepanel.css`
+- Nouvelle règle `.stt-result-actions` (flex, écart de 6 px) pour
+  aligner « Copier » et « Exporter en Markdown » côte à côte. Le bouton
+  d'export réutilise le style `.stt-copy-btn` existant.
+
+---
+
 ## 2026-10-28 — Transcription diarisée : groupement des locuteurs et copie enrichie
 
 ### Contexte et objectif

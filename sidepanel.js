@@ -526,6 +526,19 @@ function formatDuration(seconds) {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+// Explicit long form for metadata, e.g. "06 minutes 25 secondes".
+function formatDurationLong(seconds) {
+  const total = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const parts = [];
+  if (h > 0) parts.push(`${String(h).padStart(2, "0")} heure${h !== 1 ? "s" : ""}`);
+  if (h > 0 || m > 0) parts.push(`${String(m).padStart(2, "0")} minute${m !== 1 ? "s" : ""}`);
+  parts.push(`${String(s).padStart(2, "0")} seconde${s !== 1 ? "s" : ""}`);
+  return parts.join(" ");
+}
+
 function updateRecordTimer() {
   const elapsed = Math.floor((Date.now() - recordStartTime) / 1000);
   recordTimer.textContent = formatDuration(elapsed);
@@ -721,6 +734,62 @@ async function transcribeAudio(blob) {
 // ---- Transcription display ----
 // `diarizedOverride` is used when re-opening a saved transcription from
 // history (the current `diarizeEnabled` state may have changed since).
+
+// Group consecutive segments by speaker: returns [{ label, text }].
+function groupSegmentsBySpeaker(result) {
+  const groups = [];
+  let currentKey = null;
+  let current = null;
+  for (const seg of result.segments) {
+    const label = seg.speaker_id != null
+      ? `Locuteur ${parseInt(String(seg.speaker_id).replace(/\D/g, ""), 10)}`
+      : (seg.speaker || "Locuteur");
+    const key = seg.speaker_id != null ? String(seg.speaker_id) : label;
+    const text = (seg.text || "").trim();
+    if (key !== currentKey) {
+      current = { label, text };
+      groups.push(current);
+      currentKey = key;
+    } else {
+      current.text += (current.text ? " " : "") + text;
+    }
+  }
+  return groups;
+}
+
+// Build a Markdown document from a transcription result.
+function buildTranscriptionMarkdown(result, duration, showDiarized) {
+  const lines = ["# Transcription", ""];
+  const meta = [formatDurationLong(duration)];
+  if (result.language) meta.push(`Langue : ${result.language}`);
+  if (showDiarized) meta.push("Diarisation");
+  lines.push(`_${meta.join(" · ")}_`, "");
+  if (showDiarized && Array.isArray(result.segments) && result.segments.length > 0) {
+    for (const g of groupSegmentsBySpeaker(result)) {
+      lines.push(`**${g.label}** : ${g.text}`, "");
+    }
+  } else {
+    lines.push(result.text || "(transcription vide)", "");
+  }
+  return lines.join("\n").replace(/\n+$/, "") + "\n";
+}
+
+// Trigger a browser download of the given Markdown content.
+function downloadMarkdownFile(markdown) {
+  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  a.href = url;
+  a.download = `transcription-${stamp}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 function displayTranscription(result, duration, diarizedOverride) {
   const showDiarized = diarizedOverride !== undefined ? diarizedOverride : diarizeEnabled;
   const div = document.createElement("div");
@@ -731,10 +800,13 @@ function displayTranscription(result, duration, diarizedOverride) {
   header.className = "stt-result-header";
   const meta = document.createElement("div");
   meta.className = "stt-result-meta";
-  const parts = [formatDuration(duration)];
+  const parts = [formatDurationLong(duration)];
   if (result.language) parts.push(`Langue : ${result.language}`);
   if (showDiarized) parts.push("Diarisation");
   meta.textContent = parts.join(" · ");
+
+  const actions = document.createElement("div");
+  actions.className = "stt-result-actions";
 
   const copyBtn = document.createElement("button");
   copyBtn.className = "stt-copy-btn";
@@ -742,27 +814,9 @@ function displayTranscription(result, duration, diarizedOverride) {
   copyBtn.addEventListener("click", () => {
     let copyText = result.text || "";
     if (showDiarized && Array.isArray(result.segments) && result.segments.length > 0) {
-      const lines = [];
-      let currentKey = null;
-      let currentLabel = "";
-      let currentText = "";
-      for (const seg of result.segments) {
-        const label = seg.speaker_id != null
-          ? `Locuteur ${parseInt(String(seg.speaker_id).replace(/\D/g, ""), 10)}`
-          : (seg.speaker || "Locuteur");
-        const key = seg.speaker_id != null ? String(seg.speaker_id) : label;
-        const text = (seg.text || "").trim();
-        if (key !== currentKey) {
-          if (currentKey !== null) lines.push(`[${currentLabel}] : ${currentText}`);
-          currentKey = key;
-          currentLabel = label;
-          currentText = text;
-        } else {
-          currentText += (currentText ? " " : "") + text;
-        }
-      }
-      if (currentKey !== null) lines.push(`[${currentLabel}] : ${currentText}`);
-      copyText = lines.join("\n\n");
+      copyText = groupSegmentsBySpeaker(result)
+        .map((g) => `[${g.label}] : ${g.text}`)
+        .join("\n\n");
     }
     navigator.clipboard.writeText(copyText).then(() => {
       copyBtn.textContent = "Copié";
@@ -774,8 +828,24 @@ function displayTranscription(result, duration, diarizedOverride) {
     });
   });
 
+  const exportBtn = document.createElement("button");
+  exportBtn.className = "stt-copy-btn";
+  exportBtn.textContent = "Exporter en Markdown";
+  exportBtn.addEventListener("click", () => {
+    const markdown = buildTranscriptionMarkdown(result, duration, showDiarized);
+    downloadMarkdownFile(markdown);
+    exportBtn.textContent = "Exporté";
+    exportBtn.classList.add("copied");
+    setTimeout(() => {
+      exportBtn.textContent = "Exporter en Markdown";
+      exportBtn.classList.remove("copied");
+    }, 2000);
+  });
+
   header.appendChild(meta);
-  header.appendChild(copyBtn);
+  actions.appendChild(copyBtn);
+  actions.appendChild(exportBtn);
+  header.appendChild(actions);
   div.appendChild(header);
 
   // Content: diarized segments or plain text.
