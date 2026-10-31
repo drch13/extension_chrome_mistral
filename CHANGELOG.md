@@ -3,8 +3,11 @@
 Tous les changements notables de ce projet sont documentés dans ce fichier.
 
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et le
-versionnement suit [Semantic Versioning](https://semver.org/lang/fr/) :
-une version par date, une entrée pouvant regrouper plusieurs changements.
+versionnement suit [Semantic Versioning](https://semver.org/lang/fr/). Les
+changements s'accumulent dans la section `[Unreleased]` en tête de fichier ;
+lorsqu'une version est publiée (au plus une par date), cette section est
+renommée `[MAJEURE.MINEURE.PATCH] - AAAA-MM-JJ` par un commit de release
+(`chore(release)`), qui tag le dépôt et aligne `manifest.json`.
 
 Les catégories standardisées (`Added`, `Changed`, `Deprecated`, `Removed`,
 `Fixed`, `Security`) décrivent les changements ; elles sont complétées par des
@@ -15,6 +18,15 @@ Historique de versions 1.0.0 → 1.7.0 reconstruit rétroactivement le
 2026-10-31 à partir de l'historique git et des entrées datées ; ces versions
 n'ont pas de tag git. Le champ `version` de `manifest.json` sera aligné lors
 du prochain changement fonctionnel.
+
+---
+
+## [Unreleased]
+
+*(Changements non encore publiés : chaque modification documentée s'accumule
+ici, sans numéro ni date. La publication d'une version renomme cette section
+en `[X.Y.Z] - AAAA-MM-JJ` via un commit de release, qui porte aussi le tag
+git et le bump de `manifest.json`.)*
 
 ---
 
