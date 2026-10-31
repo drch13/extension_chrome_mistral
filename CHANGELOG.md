@@ -28,6 +28,29 @@ ici, sans numéro ni date. La publication d'une version renomme cette section
 en `[X.Y.Z] - AAAA-MM-JJ` via un commit de release, qui porte aussi le tag
 git et le bump de `manifest.json`.)*
 
+### Added
+
+- `README.md` : présentation de l'extension à destination de tout
+  utilisateur — objectif, fonctionnalités des modes Chat et Transcription,
+  installation dans Chrome (extension non empaquetée), tableau des données
+  stockées dans `chrome.storage.local`, description des appels réseau
+  entrants et sortants (API Mistral uniquement), et mention explicite qu'il
+  s'agit d'un projet personnel sans lien officiel avec Mistral AI.
+- `HANDOVER.md` : prochaines étapes de développement — toggle thème
+  clair/sombre (à trois états, avec pistes d'implémentation sur les
+  variables CSS existantes) et paramétrage de la langue de l'interface
+  (français, anglais, espagnol, italien, portugais, allemand ; recensement
+  des chaînes concernées, comparaison `chrome.i18n` vs dictionnaire JS,
+  décision à prendre sur la langue du prompt système).
+
+### Changed
+
+- Workflow de publication documenté dans `AGENTS.md` et le préambule du
+  changelog : les changements s'accumulent sous `[Unreleased]` ; la
+  publication d'une version se fait par un commit de release
+  `chore(release): vX.Y.Z` (renommage de la section, bump de
+  `manifest.json`, tag posé sur ce dernier commit).
+
 ---
 
 ## [1.7.0] - 2026-10-31 — Sélection de texte rattachée à chaque question du Chat
