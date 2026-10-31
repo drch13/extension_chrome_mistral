@@ -295,10 +295,21 @@ function renderMarkdown(text) {
   return out;
 }
 
-function addMsg(role, text) {
+// User bubble. When the question carries a page selection, show a truncated
+// excerpt below it; the full excerpt is sent to the model by buildMessages.
+const USER_MSG_SELECTION_PREVIEW = 200;
+function addUserMsg(text, selection) {
   const div = document.createElement("div");
-  div.className = `msg ${role}`;
+  div.className = "msg user";
   div.textContent = text;
+  if (selection) {
+    const ex = document.createElement("div");
+    ex.className = "msg-selection";
+    ex.textContent = selection.length > USER_MSG_SELECTION_PREVIEW
+      ? selection.slice(0, USER_MSG_SELECTION_PREVIEW) + "…"
+      : selection;
+    div.appendChild(ex);
+  }
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
   return div;
@@ -1101,7 +1112,7 @@ function renderChat() {
     if (m.role === "assistant") {
       addAssistantBubble(m.reasoning || "", m.content);
     } else {
-      addMsg("user", m.content);
+      addUserMsg(m.content, m.selection);
     }
   }
 }
@@ -1443,12 +1454,15 @@ function updateSelectionBox(text) {
   }
 }
 
+// Returns true when the selection was successfully refreshed (or deliberately
+// cleared), false when the tab could not be polled — in that case
+// currentSelection may be stale.
 async function pollSelectionOnce() {
   const tab = await getActiveTab();
-  if (!tab || !tab.id) return;
+  if (!tab || !tab.id) return false;
   if (/^(chrome|edge|about|chrome-extension|file):/i.test(tab.url || "")) {
     updateSelectionBox("");
-    return;
+    return true;
   }
   try {
     const [{ result }] = await chrome.scripting.executeScript({
@@ -1456,8 +1470,10 @@ async function pollSelectionOnce() {
       func: () => window.getSelection().toString(),
     });
     updateSelectionBox(result || "");
+    return true;
   } catch (err) {
     // No access to this tab (e.g. restricted page): leave the box as-is.
+    return false;
   }
 }
 
@@ -1502,16 +1518,14 @@ function buildMessages() {
     "Base-toi principalement sur le contenu fourni ci-dessous (page courante). " +
     "Si l'information n'est pas présente, dis-le et réponds à partir de tes connaissances générales en le précisant.";
 
-  if (currentSelection) {
-    sysContent +=
-      "\n\nL'utilisateur a sélectionné une zone de texte précise sur la page. " +
-      "Ta réponse doit porter prioritairement sur cette sélection ; utilise le reste du contenu de la page comme contexte pour l'expliquer ou la préciser.";
-    sysContent +=
-      "\n\n===== SÉLECTION DE L'UTILISATEUR (zone ciblée) =====\n" +
-      "--------------------------------------\n" +
-      `${currentSelection}\n` +
-      "======================================";
-  }
+  // The user's page excerpt is attached to the user message it belongs to (see
+  // below), so deictic references like "ce passage" or "cet autre passage"
+  // stay unambiguous across turns, even when the selection changes mid-chat.
+  sysContent +=
+    "\n\nCertains messages de l'utilisateur contiennent un bloc « EXTRAIT SÉLECTIONNÉ » : " +
+    "il s'agit du passage de la page que l'utilisateur a sélectionné pour poser CETTE question. " +
+    "Ta réponse doit porter prioritairement sur cet extrait ; " +
+    "utilise le reste du contenu de la page comme contexte pour l'expliquer ou le préciser.";
 
   if (lastContext && lastContext.text) {
     sysContent +=
@@ -1525,7 +1539,18 @@ function buildMessages() {
   }
 
   const msgs = [{ role: "system", content: sysContent }];
-  for (const m of history) msgs.push({ role: m.role, content: m.content });
+  for (const m of history) {
+    let content = m.content;
+    // Each user message carries its own excerpt (captured at send time), so
+    // the model always sees which passage a given question refers to.
+    if (m.role === "user" && m.selection) {
+      content +=
+        "\n\n===== EXTRAIT SÉLECTIONNÉ SUR LA PAGE (par l'utilisateur, pour cette question) =====\n" +
+        `${m.selection}\n` +
+        "===== FIN DE L'EXTRAIT SÉLECTIONNÉ =====";
+    }
+    msgs.push({ role: m.role, content });
+  }
   return msgs;
 }
 
@@ -1674,13 +1699,16 @@ async function send() {
 
   // Grab fresh page content and selection for this question.
   lastContext = await fetchPageContent();
-  await pollSelectionOnce(); // refresh currentSelection so it matches the page at send time
+  // Refresh currentSelection so it matches the page at send time.
+  const selectionFresh = await pollSelectionOnce();
 
   setBusy(true);
   // Clear the welcome placeholder on the first message of a fresh chat.
   if (history.length === 0) chatEl.innerHTML = "";
-  addMsg("user", question);
-  history.push({ role: "user", content: question });
+  addUserMsg(question, currentSelection);
+  // Snapshot the selection with the question: past turns keep their excerpt
+  // (persisted with the conversation), so later deictic references resolve.
+  history.push({ role: "user", content: question, selection: currentSelection || "" });
   promptInput.value = "";
 
   try {
@@ -1690,6 +1718,9 @@ async function send() {
     } else {
       addContextChip(`${(lastContext && (lastContext.title || lastContext.url)) || "page inconnue"} · contenu indisponible`);
       addSystem("Aucun contenu de page détecté. Le modèle répondra sans contexte de page (page interne, ou contenu non encore chargé).");
+    }
+    if (!selectionFresh && currentSelection) {
+      addSystem("Sélection non vérifiable sur la page (onglet inaccessible) : l'extrait joint à la question peut ne plus correspondre à la sélection actuelle.");
     }
     const result = await streamMistral(question);
     if (result && result.answer) {

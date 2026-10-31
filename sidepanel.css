@@ -299,6 +299,14 @@ body {
   color: var(--bubble-user-fg);
   border-bottom-right-radius: 4px;
 }
+/* Truncated page excerpt attached to a user question. */
+.msg-selection {
+  margin-top: 6px;
+  padding: 3px 8px;
+  border-left: 2px solid rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+  opacity: 0.85;
+}
 .msg.ai {
   align-self: flex-start;
   background: var(--bubble-ai);

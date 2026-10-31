@@ -2,6 +2,59 @@
 
 ---
 
+## 2026-10-31 — Sélection de texte rattachée à chaque question du Chat
+
+### Contexte et objectif
+
+La sélection de texte de la page était injectée uniquement dans le
+prompt système, à un emplacement unique non rattaché à un tour de
+conversation. Au premier échange le modèle percevait bien l'extrait,
+mais dès le deuxième tour les références déictiques (« ce passage »,
+« cet autre passage ») devenaient ambiguës : l'extrait du tour
+précédent disparaissait du prompt et le bloc « SÉLECTION » courant
+pouvait être attribué au mauvais tour, conduisant le modèle à traduire
+une mauvaise section de la page.
+
+### Modifications apportées
+
+- Chaque message utilisateur embarque désormais sa propre sélection,
+  capturée à l'envoi : `history.push({ role, content, selection })`.
+  L'extrait est envoyé au modèle dans le message lui-même, entre
+  marqueurs `EXTRAIT SÉLECTIONNÉ SUR LA PAGE`, ce qui rend chaque
+  référence déictique non ambiguë, même quand la sélection change
+  en cours de conversation.
+- `buildMessages()` n'écrit plus de bloc SÉLECTION dans le prompt
+  système ; il y explique en revanche le format du marqueur et la
+  priorité à donner à l'extrait.
+- Le champ `selection` est persisté avec la conversation (les messages
+  sont sauvegardés tels quels) : une conversation rechargée conserve
+  les extraits de chaque tour.
+- `pollSelectionOnce()` retourne désormais un statut ; si le rafraîchissement
+  de la sélection échoue à l'envoi (onglet inaccessible), un message
+  système avertit que l'extrait joint peut être périmé, au lieu de
+  renvoyer silencieusement la sélection précédente.
+- Nouvelle fonction `addUserMsg()` : la bulle utilisateur affiche un
+  extrait tronqué (200 caractères) de la sélection jointe à la
+  question, y compris pour les conversations rechargées. L'ancienne
+  fonction générique `addMsg()`, devenue sans appelant, est supprimée.
+- Style `.msg-selection` (`sidepanel.css`) pour cet extrait.
+
+### Fichiers modifiés
+
+#### `sidepanel.js`
+- `addUserMsg()` ajoutée ; `addMsg()` supprimée ;
+- `buildMessages()` : consigne sur le marqueur + boucle d'historique
+  enrichie par message ;
+- `pollSelectionOnce()` : retour d'un statut de fraîcheur ;
+- `send()` : capture du statut, `selection` sur le message poussé,
+  avertissement si non vérifiable ;
+- `renderChat()` : rendu via `addUserMsg(m.content, m.selection)`.
+
+#### `sidepanel.css`
+- Bloc `.msg-selection`.
+
+---
+
 ## 2026-10-30 — Durée explicite dans les métadonnées de transcription
 
 ### Contexte et objectif
